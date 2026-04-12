@@ -66,7 +66,7 @@ CONFIG = {
     # Logging
     "log_file": "bot_trades.json",
     "print_heatmap": True,          # Print full heatmap on each refresh
-    "dc_heatmap_interval": 900,      # Send heatmap to Discord every 15 min
+    "dc_heatmap_interval": 300,      # Send heatmap to Discord every 5 min
 }
 
 
