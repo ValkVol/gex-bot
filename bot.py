@@ -426,6 +426,13 @@ def run_bot():
             now = datetime.utcnow()
             hour = now.hour
 
+            # ── Weekend check ───────────────────────────────────────────
+            if now.weekday() >= 5:  # Saturday=5, Sunday=6
+                if now.hour == 0 and now.minute == 0 and now.second < 5:
+                    print(f"[BOT] Weekend. Sleeping until Monday...")
+                time.sleep(300)  # 5 min sleep on weekends
+                continue
+
             # ── Session filter ──────────────────────────────────────────
             if hour < cfg["session_start_utc"] or hour >= cfg["session_end_utc"]:
                 if now.minute == 0 and now.second < 5:
@@ -433,8 +440,10 @@ def run_bot():
                 time.sleep(30)
                 continue
 
-            # ── Refresh GEX ─────────────────────────────────────────────
-            if time.time() - last_gex_refresh > cfg["gex_refresh_sec"]:
+            try:
+
+             # ── Refresh GEX ─────────────────────────────────────────────
+             if time.time() - last_gex_refresh > cfg["gex_refresh_sec"]:
                 gex.compute()
                 last_gex_refresh = time.time()
 
@@ -444,8 +453,8 @@ def run_bot():
                     nearest_below = gex.get_node_below(gex.spot)
                     growing = gex.get_growing_nodes()
 
-                    above_str = f"${nearest_above.strike:.0f}({nearest_above.action[0]}{nearest_above.direction[0]})" if nearest_above else "---"
-                    below_str = f"${nearest_below.strike:.0f}({nearest_below.action[0]}{nearest_below.direction[0]})" if nearest_below else "---"
+                    above_str = f"${nearest_above.strike:.0f}({nearest_above.action[0]}{nearest_above.dex_bias[0]})" if nearest_above else "---"
+                    below_str = f"${nearest_below.strike:.0f}({nearest_below.action[0]}{nearest_below.dex_bias[0]})" if nearest_below else "---"
                     grow_str = f" | GROWING: {','.join(f'${n.strike:.0f}' for n in growing[:3])}" if growing else ""
 
                     print(f"[GEX] {now:%H:%M:%S} QQQ ${gex.spot:.2f} | "
@@ -572,6 +581,10 @@ def run_bot():
 
             print()
             time.sleep(3)
+
+            except Exception as e:
+                print(f"[BOT] Error in loop: {e}")
+                time.sleep(10)
 
     except KeyboardInterrupt:
         print("\n[BOT] Shutting down...")
