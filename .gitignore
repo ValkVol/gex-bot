@@ -1,0 +1,16 @@
+# GEX Bot - Railway Deployment
+# Only the live/ directory is needed
+
+# Ignore backtest files
+*.csv
+*.png
+__pycache__/
+*.pyc
+test_*.py
+sweep_*.py
+analyze_*.py
+backtest_*.py
+gex_preprocess*.py
+
+# Don't commit secrets
+.env
