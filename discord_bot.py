@@ -131,7 +131,7 @@ class GEXBot(commands.Bot):
     """Discord bot with GEX commands. Shares state with the trading loop."""
 
     def __init__(self, gex_engine=None, day_tracker=None, trade_logger=None,
-                 signal_engine=None, mt5_live=False):
+                 signal_engine=None, mt5_live=False, alerts=None):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
@@ -141,8 +141,10 @@ class GEXBot(commands.Bot):
         self.logger = trade_logger
         self.signal_engine = signal_engine
         self.mt5_live = mt5_live
+        self.alerts = alerts
         self._thread = None
         self._loop = None
+        self._ready_event = threading.Event()
 
         # Register commands
         self.add_command(commands.Command(self.levels, name="levels"))
@@ -151,6 +153,23 @@ class GEXBot(commands.Bot):
 
     async def on_ready(self):
         print(f"[DC-BOT] Logged in as {self.user} (ID: {self.user.id})")
+
+        # Find first text channel we can send to
+        alert_channel = None
+        for guild in self.guilds:
+            for ch in guild.text_channels:
+                if ch.permissions_for(guild.me).send_messages:
+                    alert_channel = ch
+                    break
+            if alert_channel:
+                break
+
+        # Share connection with DiscordAlerts
+        if self.alerts and alert_channel:
+            self.alerts.attach(self, self._loop)
+            self.alerts.set_channel(alert_channel)
+
+        self._ready_event.set()
 
     # ── !levels ─────────────────────────────────────────────────────────
     async def levels(self, ctx):
@@ -333,7 +352,14 @@ class GEXBot(commands.Bot):
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
-        print("[DC-BOT] Starting command bot in background...")
+        print("[DC-BOT] Starting bot in background...")
+
+        # Wait for bot to be ready (max 20 seconds)
+        if self._ready_event.wait(timeout=20):
+            print("[DC-BOT] Bot ready!")
+        else:
+            print("[DC-BOT] WARNING: Bot took too long to connect")
+
         return True
 
     def stop_background(self):

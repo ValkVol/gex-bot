@@ -396,13 +396,14 @@ def run_bot():
     dc = DiscordAlerts()
     tracker = DayTracker()
 
-    # Start interactive Discord bot (for !levels, !status, !heatmap)
+    # Start interactive Discord bot (for !levels, !status, !heatmap + alerts)
     dc_bot = GEXBot(
         gex_engine=gex,
         day_tracker=tracker,
         trade_logger=logger,
         signal_engine=signal,
         mt5_live=False,  # Updated after MT5 connect
+        alerts=dc,
     )
 
     # Connect MT5
