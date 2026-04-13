@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gex_engine import GEXEngine
 from mt5_executor import MT5Executor
 from discord_alerts import DiscordAlerts
+from discord_bot import GEXBot, DayTracker
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -393,17 +394,32 @@ def run_bot():
     signal = SignalEngine(cfg)
     logger = TradeLogger(os.path.join(os.path.dirname(__file__), cfg["log_file"]))
     dc = DiscordAlerts()
+    tracker = DayTracker()
+
+    # Start interactive Discord bot (for !levels, !status, !heatmap)
+    dc_bot = GEXBot(
+        gex_engine=gex,
+        day_tracker=tracker,
+        trade_logger=logger,
+        signal_engine=signal,
+        mt5_live=False,  # Updated after MT5 connect
+    )
 
     # Connect MT5
     print("\n[BOT] Connecting to MetaTrader 5...")
     mt5_live = mt5.connect()
+    dc_bot.mt5_live = mt5_live
     if not mt5_live:
         print("[BOT] MT5 not connected - running in SIGNAL-ONLY mode")
         print("[BOT] Signals will be printed but not executed\n")
 
+    # Start Discord command bot in background
+    dc_bot.start_background()
+
     # Initial GEX
     print("[BOT] Loading 0DTE GEX heatmap...")
     gex.compute()
+    tracker.update(gex.spot, gex.nodes)  # Track initial levels
     if cfg["print_heatmap"]:
         gex.print_heatmap()
 
@@ -441,146 +457,146 @@ def run_bot():
                 continue
 
             try:
+                # ── Refresh GEX ─────────────────────────────────────────
+                if time.time() - last_gex_refresh > cfg["gex_refresh_sec"]:
+                    gex.compute()
+                    tracker.update(gex.spot, gex.nodes)  # Track levels
+                    last_gex_refresh = time.time()
 
-             # ── Refresh GEX ─────────────────────────────────────────────
-             if time.time() - last_gex_refresh > cfg["gex_refresh_sec"]:
-                gex.compute()
-                last_gex_refresh = time.time()
+                    # Print compact update
+                    if gex.nodes:
+                        nearest_above = gex.get_node_above(gex.spot)
+                        nearest_below = gex.get_node_below(gex.spot)
+                        growing = gex.get_growing_nodes()
 
-                # Print compact update
-                if gex.nodes:
-                    nearest_above = gex.get_node_above(gex.spot)
-                    nearest_below = gex.get_node_below(gex.spot)
-                    growing = gex.get_growing_nodes()
+                        above_str = f"${nearest_above.strike:.0f}({nearest_above.action[0]}{nearest_above.dex_bias[0]})" if nearest_above else "---"
+                        below_str = f"${nearest_below.strike:.0f}({nearest_below.action[0]}{nearest_below.dex_bias[0]})" if nearest_below else "---"
+                        grow_str = f" | GROWING: {','.join(f'${n.strike:.0f}' for n in growing[:3])}" if growing else ""
 
-                    above_str = f"${nearest_above.strike:.0f}({nearest_above.action[0]}{nearest_above.dex_bias[0]})" if nearest_above else "---"
-                    below_str = f"${nearest_below.strike:.0f}({nearest_below.action[0]}{nearest_below.dex_bias[0]})" if nearest_below else "---"
-                    grow_str = f" | GROWING: {','.join(f'${n.strike:.0f}' for n in growing[:3])}" if growing else ""
+                        print(f"[GEX] {now:%H:%M:%S} QQQ ${gex.spot:.2f} | "
+                              f"Above: {above_str} Below: {below_str}{grow_str} | "
+                              f"State: {signal.state}")
 
-                    print(f"[GEX] {now:%H:%M:%S} QQQ ${gex.spot:.2f} | "
-                          f"Above: {above_str} Below: {below_str}{grow_str} | "
-                          f"State: {signal.state}")
+                    # Full heatmap every 5 min (console)
+                    if cfg["print_heatmap"] and time.time() - last_heatmap_print > 300:
+                        gex.print_heatmap()
+                        last_heatmap_print = time.time()
 
-                # Full heatmap every 5 min (console)
-                if cfg["print_heatmap"] and time.time() - last_heatmap_print > 300:
-                    gex.print_heatmap()
-                    last_heatmap_print = time.time()
+                    # Discord heatmap update
+                    if time.time() - last_dc_heatmap > cfg["dc_heatmap_interval"]:
+                        nearest = gex.get_nearest_nodes(gex.spot, 8)
+                        nearest.sort(key=lambda n: n.strike, reverse=True)
+                        dc.heatmap_update(
+                            gex.spot, nearest, gex.net_gex, gex.atm_iv,
+                            gex.get_growing_nodes()[:3]
+                        )
+                        last_dc_heatmap = time.time()
 
-                # Discord heatmap update
-                if time.time() - last_dc_heatmap > cfg["dc_heatmap_interval"]:
-                    nearest = gex.get_nearest_nodes(gex.spot, 8)
-                    nearest.sort(key=lambda n: n.strike, reverse=True)
-                    dc.heatmap_update(
-                        gex.spot, nearest, gex.net_gex, gex.atm_iv,
-                        gex.get_growing_nodes()[:3]
-                    )
-                    last_dc_heatmap = time.time()
+                # ── Get QQQ price ───────────────────────────────────────
+                qqq_price = gex.get_spot()
+                if qqq_price <= 0:
+                    time.sleep(5)
+                    continue
 
-            # ── Get QQQ price ───────────────────────────────────────────
-            qqq_price = gex.get_spot()
-            if qqq_price <= 0:
-                time.sleep(5)
-                continue
+                # ── Daily loss limit ────────────────────────────────────
+                daily_pnl = logger.daily_pnl()
+                if daily_pnl <= cfg["max_daily_loss_usd"]:
+                    print(f"[BOT] DAILY LOSS LIMIT: ${daily_pnl:.2f}. Stopping for today.")
+                    # Close any open position
+                    if mt5_live and active_ticket:
+                        mt5.close_trade(active_ticket)
+                    break
 
-            # ── Daily loss limit ────────────────────────────────────────
-            daily_pnl = logger.daily_pnl()
-            if daily_pnl <= cfg["max_daily_loss_usd"]:
-                print(f"[BOT] DAILY LOSS LIMIT: ${daily_pnl:.2f}. Stopping for today.")
-                # Close any open position
+                # ── Check open position ─────────────────────────────────
                 if mt5_live and active_ticket:
-                    mt5.close_trade(active_ticket)
-                break
+                    positions = mt5.get_open_positions()
+                    bot_pos = [p for p in positions if p.ticket == active_ticket]
+                    if not bot_pos:
+                        print(f"[BOT] Position {active_ticket} closed (SL/TP hit)")
+                        active_ticket = None
+                        active_trade_idx = None
 
-            # ── Check open position ─────────────────────────────────────
-            if mt5_live and active_ticket:
-                positions = mt5.get_open_positions()
-                bot_pos = [p for p in positions if p.ticket == active_ticket]
-                if not bot_pos:
-                    print(f"[BOT] Position {active_ticket} closed (SL/TP hit)")
-                    active_ticket = None
-                    active_trade_idx = None
+                # ── Max position check ──────────────────────────────────
+                open_count = len(mt5.get_open_positions()) if mt5_live else (1 if active_ticket else 0)
+                if open_count >= cfg["max_positions"]:
+                    time.sleep(3)
+                    continue
 
-            # ── Max position check ──────────────────────────────────────
-            open_count = len(mt5.get_open_positions()) if mt5_live else (1 if active_ticket else 0)
-            if open_count >= cfg["max_positions"]:
-                time.sleep(3)
-                continue
+                # ── Signal evaluation ───────────────────────────────────
+                result = signal.evaluate(qqq_price, gex)
 
-            # ── Signal evaluation ───────────────────────────────────────
-            result = signal.evaluate(qqq_price, gex)
+                if result[0] is None:
+                    time.sleep(3)
+                    continue
 
-            if result[0] is None:
-                time.sleep(3)
-                continue
+                sig_type, entry_node, target_node, direction, stop_qqq, target_qqq, dex_conf = result
 
-            sig_type, entry_node, target_node, direction, stop_qqq, target_qqq, dex_conf = result
+                # ── SIGNAL FIRED ────────────────────────────────────────
 
-            # ── SIGNAL FIRED ────────────────────────────────────────────
+                risk_qqq = abs(qqq_price - stop_qqq)
+                reward_qqq = abs(target_qqq - qqq_price)
+                rr = reward_qqq / risk_qqq if risk_qqq > 0 else 0
 
-            risk_qqq = abs(qqq_price - stop_qqq)
-            reward_qqq = abs(target_qqq - qqq_price)
-            rr = reward_qqq / risk_qqq if risk_qqq > 0 else 0
+                target_info = f"${target_node.strike:.0f}" if target_node else f"${target_qqq:.2f}"
+                growth_tag = " [TARGET GROWING]" if (target_node and target_node.growing) else ""
+                conf_bar = "!" * int(dex_conf * 10)
+                dex_label = f"DEX conf: {dex_conf:.0%} {conf_bar}"
 
-            target_info = f"${target_node.strike:.0f}" if target_node else f"${target_qqq:.2f}"
-            growth_tag = " [TARGET GROWING]" if (target_node and target_node.growing) else ""
-            conf_bar = "!" * int(dex_conf * 10)
-            dex_label = f"DEX conf: {dex_conf:.0%} {conf_bar}"
+                print(f"\n{'*'*70}")
+                print(f"  SIGNAL: {sig_type} | {direction} | {dex_label}")
+                print(f"  Node: ${entry_node.strike:.0f} | "
+                      f"GEX: {entry_node.gex:+,.0f} | DEX: {entry_node.dex:+,.0f} "
+                      f"(bias: {entry_node.dex_bias})")
+                print(f"  QQQ: ${qqq_price:.2f} | "
+                      f"Stop: ${stop_qqq:.2f} | Target: {target_info}{growth_tag}")
+                print(f"  Risk: ${risk_qqq:.2f} | Reward: ${reward_qqq:.2f} | R:R = 1:{rr:.1f}")
+                print(f"{'*'*70}")
 
-            print(f"\n{'*'*70}")
-            print(f"  SIGNAL: {sig_type} | {direction} | {dex_label}")
-            print(f"  Node: ${entry_node.strike:.0f} | "
-                  f"GEX: {entry_node.gex:+,.0f} | DEX: {entry_node.dex:+,.0f} "
-                  f"(bias: {entry_node.dex_bias})")
-            print(f"  QQQ: ${qqq_price:.2f} | "
-                  f"Stop: ${stop_qqq:.2f} | Target: {target_info}{growth_tag}")
-            print(f"  Risk: ${risk_qqq:.2f} | Reward: ${reward_qqq:.2f} | R:R = 1:{rr:.1f}")
-            print(f"{'*'*70}")
+                # ── Execute on MT5 ──────────────────────────────────────
+                executed = False
+                ticket = None
+                nq_price_exec = None
 
-            # ── Execute on MT5 ──────────────────────────────────────────
-            executed = False
-            ticket = None
-            nq_price_exec = None
+                if mt5_live:
+                    nq_bid, nq_ask = mt5.get_price()
+                    if nq_bid and nq_ask:
+                        nq_price_exec = nq_ask if direction == "LONG" else nq_bid
 
-            if mt5_live:
-                nq_bid, nq_ask = mt5.get_price()
-                if nq_bid and nq_ask:
-                    nq_price_exec = nq_ask if direction == "LONG" else nq_bid
+                        # Convert QQQ levels to NQ
+                        nq_stop = qqq_to_nq(stop_qqq, qqq_price, nq_price_exec)
+                        nq_target = qqq_to_nq(target_qqq, qqq_price, nq_price_exec)
 
-                    # Convert QQQ levels to NQ
-                    nq_stop = qqq_to_nq(stop_qqq, qqq_price, nq_price_exec)
-                    nq_target = qqq_to_nq(target_qqq, qqq_price, nq_price_exec)
+                        print(f"  NQ: {nq_price_exec:.2f} | SL: {nq_stop:.2f} | TP: {nq_target:.2f}")
 
-                    print(f"  NQ: {nq_price_exec:.2f} | SL: {nq_stop:.2f} | TP: {nq_target:.2f}")
-
-                    comment = f"GEX_{entry_node.strike:.0f}_{sig_type[:2]}_{direction[0]}"
-                    ticket = mt5.open_trade(direction, stop_loss=nq_stop,
-                                            take_profit=nq_target, comment=comment)
-                    if ticket:
-                        active_ticket = ticket
-                        active_trade_idx = logger.log_entry(
-                            sig_type, direction, qqq_price, nq_price_exec,
-                            entry_node, target_node, stop_qqq, target_qqq, ticket)
-                        print(f"  [EXECUTED] Ticket: {ticket}")
-                        executed = True
+                        comment = f"GEX_{entry_node.strike:.0f}_{sig_type[:2]}_{direction[0]}"
+                        ticket = mt5.open_trade(direction, stop_loss=nq_stop,
+                                                take_profit=nq_target, comment=comment)
+                        if ticket:
+                            active_ticket = ticket
+                            active_trade_idx = logger.log_entry(
+                                sig_type, direction, qqq_price, nq_price_exec,
+                                entry_node, target_node, stop_qqq, target_qqq, ticket)
+                            print(f"  [EXECUTED] Ticket: {ticket}")
+                            executed = True
+                        else:
+                            print(f"  [FAILED] Order not filled")
                     else:
-                        print(f"  [FAILED] Order not filled")
+                        print(f"  [ERROR] No NQ price available")
                 else:
-                    print(f"  [ERROR] No NQ price available")
-            else:
-                # Signal-only mode
-                logger.log_entry(sig_type, direction, qqq_price, 0,
-                                entry_node, target_node, stop_qqq, target_qqq, 0)
-                print(f"  [SIGNAL ONLY] Not executed (MT5 not connected)")
+                    # Signal-only mode
+                    logger.log_entry(sig_type, direction, qqq_price, 0,
+                                    entry_node, target_node, stop_qqq, target_qqq, 0)
+                    print(f"  [SIGNAL ONLY] Not executed (MT5 not connected)")
 
-            # ── Discord alert ───────────────────────────────────────────
-            dc.signal_alert(
-                sig_type, direction, qqq_price, entry_node,
-                target_node, stop_qqq, target_qqq, dex_conf,
-                executed=executed, ticket=ticket, nq_price=nq_price_exec
-            )
+                # ── Discord alert ───────────────────────────────────────
+                dc.signal_alert(
+                    sig_type, direction, qqq_price, entry_node,
+                    target_node, stop_qqq, target_qqq, dex_conf,
+                    executed=executed, ticket=ticket, nq_price=nq_price_exec
+                )
 
-            print()
-            time.sleep(3)
+                print()
+                time.sleep(3)
 
             except Exception as e:
                 print(f"[BOT] Error in loop: {e}")
@@ -590,6 +606,9 @@ def run_bot():
         print("\n[BOT] Shutting down...")
 
     finally:
+        # Stop Discord command bot
+        dc_bot.stop_background()
+
         if mt5_live:
             print(f"[BOT] Open positions: {len(mt5.get_open_positions())}")
             mt5.shutdown()
@@ -606,12 +625,21 @@ def run_bot():
             pnls = [t.get('pnl', 0) for t in today_trades if t.get('status') == 'CLOSED']
             wins = sum(1 for p in pnls if p > 0)
             losses = sum(1 for p in pnls if p <= 0)
+
+            # Get final GEX node snapshot for level recap
+            nearest_nodes = gex.get_nearest_nodes(gex.spot, 10) if gex.nodes else None
+            if nearest_nodes:
+                nearest_nodes.sort(key=lambda n: n.strike, reverse=True)
+
             dc.daily_summary(
                 daily_count, daily_pnl, wins, losses,
-                max(pnls) if pnls else 0, min(pnls) if pnls else 0
+                max(pnls) if pnls else 0, min(pnls) if pnls else 0,
+                today_trades=today_trades,
+                node_recap=nearest_nodes,
             )
 
         dc.bot_status("STOP", f"Daily P&L: **${daily_pnl:+,.2f}** | Trades: {daily_count}")
+        dc.shutdown()
         print("[BOT] Done.")
 
 
