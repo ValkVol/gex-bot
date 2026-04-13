@@ -146,10 +146,20 @@ class GEXBot(commands.Bot):
         self._loop = None
         self._ready_event = threading.Event()
 
-        # Register commands
-        self.add_command(commands.Command(self.levels, name="levels"))
-        self.add_command(commands.Command(self.status, name="status"))
-        self.add_command(commands.Command(self.heatmap, name="heatmap"))
+        # Register commands using closures (discord.py 2.3+ compatible)
+        bot_ref = self
+
+        @self.command(name="levels")
+        async def levels(ctx):
+            await bot_ref._cmd_levels(ctx)
+
+        @self.command(name="status")
+        async def status(ctx):
+            await bot_ref._cmd_status(ctx)
+
+        @self.command(name="heatmap")
+        async def heatmap(ctx):
+            await bot_ref._cmd_heatmap(ctx)
 
     async def on_ready(self):
         print(f"[DC-BOT] Logged in as {self.user} (ID: {self.user.id})")
@@ -172,7 +182,7 @@ class GEXBot(commands.Bot):
         self._ready_event.set()
 
     # ── !levels ─────────────────────────────────────────────────────────
-    async def levels(self, ctx):
+    async def _cmd_levels(self, ctx):
         """Show all current and historical GEX levels for today."""
         if not self.gex or not self.tracker:
             await ctx.send("⚠️ GEX engine not connected.")
@@ -246,7 +256,7 @@ class GEXBot(commands.Bot):
         await ctx.send(embed=embed)
 
     # ── !status ─────────────────────────────────────────────────────────
-    async def status(self, ctx):
+    async def _cmd_status(self, ctx):
         """Show current bot status, daily P&L, and state."""
         mode = "🟢 LIVE" if self.mt5_live else "🔵 SIGNAL-ONLY"
         state = self.signal_engine.state if self.signal_engine else "UNKNOWN"
@@ -282,7 +292,7 @@ class GEXBot(commands.Bot):
         await ctx.send(embed=embed)
 
     # ── !heatmap ────────────────────────────────────────────────────────
-    async def heatmap(self, ctx):
+    async def _cmd_heatmap(self, ctx):
         """Show current GEX heatmap snapshot."""
         if not self.gex or not self.gex.nodes:
             await ctx.send("⚠️ No GEX data loaded yet.")
