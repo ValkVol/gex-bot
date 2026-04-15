@@ -1,21 +1,19 @@
 """
-bot.py - 0DTE GEX Heatmap Trading Bot + VWAP Deviation Strategy
-=================================================================
-Strategy (user's real discretionary logic):
-  1. +GEX stacked nodes ($1-2 apart) = MR zone, trade between 2 biggest
-  2. +GEX +DEX = SHORT (dealers sell/fade)
-  3. +GEX -DEX = LONG  (dealers buy/fade)
-  4. -GEX +DEX = LONG  (dealers chase up, breakout)
-  5. -GEX -DEX = SHORT (dealers chase down, breakout)
-  6. Track node growth: rejected at node A + node B growing = target B
-  7. VWAP deviation mean-reversion with GARCH regime + risk filters
+bot.py - VWAP Deviation + HMM Regime Trading Bot
+===================================================
+Strategy:
+  - Intraday mean-reversion / breakout at VWAP standard deviation bands
+  - Anchored at Globex open (6 PM ET)
+  - Mode (MR vs BO) determined by dual-layer HMM regime from Altaris
+  - GEX heatmap kept for context (heatmap command + alerts)
+  - Vanna flow overlay for additional confirmation
 
-Data: Tradier API (0DTE QQQ options)
+Data: Tradier API (QQQ 0DTE for GEX context), MT5 (NQ live price)
 Execution: MetaTrader 5 (NAS100)
 """
 
-import sys, os, io, time, json, logging
-from datetime import datetime
+import sys, os, io, time, json, math
+from datetime import datetime, timedelta, timezone
 from collections import deque
 
 if sys.platform == "win32":
@@ -29,37 +27,51 @@ def print(*args, **kwargs):
     _print(*args, **kwargs)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Also add parent dir so we can import vwap_strategy from Greek Algo root
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 from gex_engine import GEXEngine
 from mt5_executor import MT5Executor
 from discord_alerts import DiscordAlerts
 from discord_bot import GEXBot, DayTracker
+
+# VWAP strategy components (from parent dir)
+try:
+    from vwap_strategy import (
+        fetch_hmm_regime, DECISION_MATRIX,
+        fetch_vanna_data, evaluate_vanna_overlay, apply_vanna_to_signal,
+    )
+    VWAP_STRATEGY_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Could not import vwap_strategy: {e}")
+    VWAP_STRATEGY_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONFIG = {
-    # GEX
+    # GEX (kept for heatmap context)
     "gex_refresh_sec": 30,          # Refresh 0DTE chain every 30s
-    "proximity_qqq": 1.00,          # Entry within $1.00 of node
-    "min_node_gex_pct": 0.15,       # Node must be top 15% by |GEX|
-    "stack_distance": 2.0,          # Nodes within $2 = stacked
+    "dc_heatmap_interval": 300,     # Send heatmap to Discord every 5 min
 
-    # Signal
-    "require_rejection": True,      # Wait for price rejection at node
-    "rejection_bars": 3,            # Min bars near node before rejecting
-    "growth_confirms_target": True, # Growing node = confirmed target
+    # VWAP
+    "vwap_bar_sec": 300,            # Build 5-minute bars from ticks
+    "vwap_band_entry_threshold": 0.15,  # SD proximity to trigger entry (e.g. 1.85 SD counts as 2 SD)
+
+    # HMM Regime
+    "regime_refresh_sec": 300,      # Refresh HMM regime every 5 min
+    "altaris_token": os.environ.get("ALTARIS_TOKEN", ""),
 
     # Risk
-    "stop_buffer_qqq": 0.75,        # Stop $0.75 beyond node (in QQQ space)
-    "rr_ratio": 1.5,                # Default R:R when no node target
     "max_daily_loss_usd": -500,     # Daily loss cap
     "max_positions": 1,             # Max concurrent trades
     "lot_size": 0.01,               # MT5 lot size
+    "cooldown_sec": 120,            # Min seconds between trades
 
     # Execution
     "mt5_symbol": "NAS100",         # Broker symbol
-    "cooldown_sec": 120,            # Min seconds between trades
 
     # Session (UTC)
     "session_start_utc": 14,        # 9:30 AM ET
@@ -68,227 +80,383 @@ CONFIG = {
     # Logging
     "log_file": "bot_trades.json",
     "print_heatmap": True,          # Print full heatmap on each refresh
-    "dc_heatmap_interval": 300,      # Send heatmap to Discord every 5 min
 }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SIGNAL ENGINE — Implements user's actual strategy logic
+#  LIVE VWAP TRACKER — Builds VWAP from live NQ ticks
 # ══════════════════════════════════════════════════════════════════════════════
 
-class SignalEngine:
+class LiveVWAPTracker:
     """
-    Detects entries based on 0DTE GEX heatmap:
-    - MR at +GEX stacked zones (trade between top 2 magnets)
-    - Breakout at -GEX nodes
-    - GEX/DEX determines direction
-    - Growing nodes confirm targets
+    Incremental VWAP calculator that accumulates live tick prices
+    and builds N-minute bars for VWAP + SD band computation.
+
+    Anchored at Globex open (6 PM ET = 22:00 UTC in winter, 22:00 UTC summer).
+    Resets automatically at session start.
+
+    Math:
+      VWAP = Σ(TP × Volume) / Σ(Volume)
+      where TP = (High + Low + Close) / 3
+      Bands = VWAP ± n × σ
+      σ = sqrt(Σ(Vol × (TP - VWAP)²) / Σ(Vol))
     """
 
-    def __init__(self, config):
-        self.cfg = config
-        self.price_history = deque(maxlen=60)  # ~3 min at 3s ticks
-        self.last_trade_time = 0
-        self.state = "SCANNING"  # SCANNING → APPROACHING → ENTRY
+    def __init__(self, bar_seconds=300):
+        self.bar_seconds = bar_seconds  # Bar period (default 5 min)
+        self.reset()
 
-        # Rejection tracking
-        self.bars_near_node = 0
-        self.approach_node = None
-        self.approach_direction = None
+    def reset(self):
+        """Reset for a new session."""
+        self.ticks = []               # Raw ticks in current building bar
+        self.bars = []                # Completed (o, h, l, c, vol) bars
+        self.current_bar_start = 0    # Epoch of current bar's start
+        self.session_date = None
 
-    def tick(self, qqq_price, timestamp=None):
-        """Record a price tick."""
+        # Running VWAP state
+        self.vwap = 0.0
+        self.std_dev = 0.0
+        self.bands = {}               # {1: (upper, lower), 2: ..., 4: ...}
+        self.current_price = 0.0
+
+        # Cumulative
+        self._cum_tp_vol = 0.0
+        self._cum_vol = 0.0
+        self._cum_var = 0.0
+
+    def tick(self, price, timestamp=None):
+        """
+        Feed a new price tick. Call this every few seconds.
+        Automatically builds bars and updates VWAP.
+        """
         ts = timestamp or time.time()
-        self.price_history.append({
-            "price": qqq_price,
-            "time": ts,
-        })
+        self.current_price = price
 
-    def _check_rejection(self, price, node):
+        # Auto-reset at new session (check date change)
+        today = datetime.utcnow().date()
+        if self.session_date and today != self.session_date:
+            # New day — reset VWAP
+            print(f"[VWAP] New session detected — resetting VWAP tracker")
+            self.reset()
+            self.session_date = today
+
+        if self.session_date is None:
+            self.session_date = today
+
+        # Initialize bar start
+        if self.current_bar_start == 0:
+            self.current_bar_start = ts
+
+        # Add tick to current building bar
+        self.ticks.append(price)
+
+        # Check if bar is complete
+        if ts - self.current_bar_start >= self.bar_seconds and len(self.ticks) >= 2:
+            self._close_bar()
+            self.current_bar_start = ts
+            self.ticks = [price]  # Start new bar with this tick
+
+        # Update running VWAP even mid-bar (use tick as micro-bar)
+        self._update_running(price)
+
+    def _close_bar(self):
+        """Close the current bar and add to bars list."""
+        if not self.ticks:
+            return
+
+        o = self.ticks[0]
+        h = max(self.ticks)
+        l = min(self.ticks)
+        c = self.ticks[-1]
+        vol = len(self.ticks)  # Tick count as volume proxy
+
+        self.bars.append((o, h, l, c, vol))
+
+    def _update_running(self, price):
         """
-        Check if price is rejecting off a node:
-        - Price approached node (within proximity)
-        - Spent N bars near it
-        - Now moving away from node
+        Update running VWAP and bands from the current tick.
+        Uses tick count as volume proxy (volume = 1 per tick).
         """
-        if len(self.price_history) < 6:
-            return False
+        tp = price  # For single tick, TP = price
+        vol = 1.0
 
-        dist = abs(price - node.strike)
-        prox = self.cfg["proximity_qqq"]
+        self._cum_tp_vol += tp * vol
+        self._cum_vol += vol
 
-        if dist <= prox:
-            # We're near the node
-            self.bars_near_node += 1
+        if self._cum_vol > 0:
+            self.vwap = self._cum_tp_vol / self._cum_vol
 
-            if self.bars_near_node >= self.cfg["rejection_bars"]:
-                # Check if price is now moving away
-                recent = [p["price"] for p in list(self.price_history)[-4:]]
-                if len(recent) >= 3:
-                    if node.strike > price:
-                        # Node is above — rejection = price moving down from node
-                        if recent[-1] < recent[-2] < recent[-3]:
-                            return True
-                    else:
-                        # Node is below — rejection = price moving up from node
-                        if recent[-1] > recent[-2] > recent[-3]:
-                            return True
+            # Running variance
+            self._cum_var += vol * (tp - self.vwap) ** 2
+            self.std_dev = math.sqrt(self._cum_var / self._cum_vol) if self._cum_vol > 1 else 0
+
+            # Bands ±1σ through ±4σ
+            for n in range(1, 5):
+                self.bands[n] = (
+                    round(self.vwap + n * self.std_dev, 2),
+                    round(self.vwap - n * self.std_dev, 2),
+                )
+
+    def price_position(self):
+        """Where is the current price relative to VWAP bands?"""
+        p = self.current_price
+        v = self.vwap
+        sd = self.std_dev
+
+        if sd <= 0 or v <= 0:
+            return {"zone": "at_vwap", "band": 0, "side": "neutral",
+                    "distance_sd": 0, "near_band": None}
+
+        distance_sd = round((p - v) / sd, 2)
+        side = "above" if p > v else "below" if p < v else "at"
+
+        abs_dist = abs(distance_sd)
+        if abs_dist < 1:
+            zone = "inner"
+            band = 0
+        elif abs_dist < 2:
+            zone = "band_1"
+            band = 1
+        elif abs_dist < 3:
+            zone = "band_2"
+            band = 2
+        elif abs_dist < 4:
+            zone = "band_3"
+            band = 3
         else:
-            self.bars_near_node = 0
+            zone = "band_4"
+            band = 4
 
-        return False
+        # Near a specific band level? (within 0.15 SD)
+        near_band = None
+        for n in range(1, 5):
+            upper, lower = self.bands.get(n, (0, 0))
+            if sd > 0:
+                if abs(p - upper) / sd < 0.15:
+                    near_band = f"+{n}σ"
+                elif abs(p - lower) / sd < 0.15:
+                    near_band = f"-{n}σ"
 
-    def _find_target_node(self, gex_engine, entry_price, direction):
-        """
-        Find target node:
-        1. If a node in the profit direction is GROWING → use that
-        2. Otherwise, use nearest significant node in profit direction
-        """
-        growing = gex_engine.get_growing_nodes()
+        return {
+            "zone": zone,
+            "band": band,
+            "side": side,
+            "distance_sd": distance_sd,
+            "near_band": near_band,
+        }
 
-        # Priority: growing node in profit direction
-        if self.cfg["growth_confirms_target"] and growing:
-            for node in growing:
-                if direction == "LONG" and node.strike > entry_price + 0.50:
-                    return node
-                elif direction == "SHORT" and node.strike < entry_price - 0.50:
-                    return node
+    def get_levels(self):
+        """Return VWAP + all band levels as dict."""
+        return {
+            "vwap": round(self.vwap, 2),
+            "std_dev": round(self.std_dev, 2),
+            "current_price": round(self.current_price, 2),
+            "band_pairs": {
+                n: {"upper": self.bands[n][0], "lower": self.bands[n][1]}
+                for n in range(1, 5) if n in self.bands
+            },
+            "bar_count": len(self.bars),
+            "tick_count": int(self._cum_vol),
+        }
 
-        # Fallback: nearest node in profit direction
-        if direction == "LONG":
-            above = gex_engine.get_node_above(entry_price)
-            if above and abs(above.strike - entry_price) > 0.50:
-                return above
-        else:
-            below = gex_engine.get_node_below(entry_price)
-            if below and abs(below.strike - entry_price) > 0.50:
-                return below
+    @property
+    def ready(self):
+        """Need at least some data before generating signals."""
+        return self._cum_vol >= 20 and self.std_dev > 0
 
-        return None
 
-    def evaluate(self, qqq_price, gex_engine):
-        """
-        Main signal evaluation. Returns:
-          (signal_type, entry_node, target_node, direction, stop_qqq, target_qqq)
-          or (None, ...) if no signal
-        """
-        # Cooldown check
-        if time.time() - self.last_trade_time < self.cfg["cooldown_sec"]:
-            return None, None, None, None, None, None
+# ══════════════════════════════════════════════════════════════════════════════
+#  VWAP SIGNAL EVALUATOR — MR/BO based on VWAP position + HMM regime
+# ══════════════════════════════════════════════════════════════════════════════
 
-        self.tick(qqq_price)
-        nodes = gex_engine.nodes
-        if not nodes:
-            return None, None, None, None, None, None
+# Mean reversion target: move this many SDs toward the mean from entry band
+TARGET_SD_MOVE = 1.5
 
-        # Get significant nodes near price
-        prox = self.cfg["proximity_qqq"]
-        near_nodes = [n for n in nodes if abs(n.strike - qqq_price) <= prox * 2]
+def evaluate_vwap_signal(vwap_tracker, regime, cfg):
+    """
+    Evaluate VWAP signal based on live tracker position + HMM regime.
 
-        if not near_nodes:
-            self.state = "SCANNING"
-            self.bars_near_node = 0
-            return None, None, None, None, None, None
+    Returns dict with:
+      signal, direction, mode, entry_zone, entry_price, stop, target,
+      risk_reward, size_scalar, reason
+    OR signal="FLAT" if no trade.
+    """
+    if not vwap_tracker.ready:
+        return {"signal": "FLAT", "reason": "VWAP tracker not ready (need more ticks)"}
 
-        # Find the node we're closest to
-        nearest = min(near_nodes, key=lambda n: abs(n.strike - qqq_price))
-        dist = abs(nearest.strike - qqq_price)
+    action = regime.get("action", "NO_TRADE")
+    decision = DECISION_MATRIX.get(action, DECISION_MATRIX.get("NO_TRADE", {
+        "mode": "flat", "active_bands": [], "size": 0, "description": "No trade"
+    }))
+    mode = decision["mode"]
+    active_bands = decision["active_bands"]
+    size = decision["size"]
 
-        if dist > prox:
-            self.state = "SCANNING"
-            self.bars_near_node = 0
-            return None, None, None, None, None, None
+    if mode == "flat" or not active_bands:
+        return {"signal": "FLAT", "reason": decision.get("description", "Regime says no trade"),
+                "mode": mode, "regime_action": action}
 
-        # We're within proximity of a node
-        self.state = "APPROACHING"
+    pos = vwap_tracker.price_position()
+    price = vwap_tracker.current_price
+    sd = vwap_tracker.std_dev
+    vwap = vwap_tracker.vwap
 
-        # ── DETERMINE DIRECTION FROM PRICE POSITION ────────────────────────
+    if sd <= 0:
+        return {"signal": "FLAT", "reason": "Zero standard deviation"}
 
-        if nearest.gex > 0:
-            # +GEX node = MEAN REVERSION
-            # Direction = fade TOWARD the node (MR)
-            # Price above node → SHORT back down to node
-            # Price below node → LONG back up to node
-            signal_type = "MR"
+    dist = pos["distance_sd"]
+    threshold = cfg.get("vwap_band_entry_threshold", 0.15)
 
-            if qqq_price >= nearest.strike:
-                direction = "SHORT"
+    if mode == "mean_reversion":
+        return _eval_mr(vwap_tracker, active_bands, size, dist, price, sd, vwap, threshold, action)
+    elif mode == "breakout":
+        return _eval_bo(vwap_tracker, active_bands, size, dist, price, sd, vwap, threshold, action)
+
+    return {"signal": "FLAT", "reason": f"Unknown mode: {mode}"}
+
+
+def _eval_mr(tracker, active_bands, size, dist, price, sd, vwap, threshold, regime_action):
+    """Mean reversion: fade price at outer bands back toward VWAP."""
+    for band_n in sorted(active_bands):
+        upper, lower = tracker.bands.get(band_n, (0, 0))
+
+        # Check upper side: price at/above +nσ → SHORT
+        if dist >= band_n - threshold:
+            stop = (tracker.bands[band_n + 1][0] if band_n < 4 and (band_n + 1) in tracker.bands
+                    else upper + sd * 0.5)
+
+            target_sd = band_n - TARGET_SD_MOVE
+            if target_sd <= 0:
+                target = vwap
+                target_label = "VWAP"
             else:
-                direction = "LONG"
+                target = vwap + target_sd * sd
+                target_label = f"+{target_sd:.1f}σ"
 
-            # Check rejection if required
-            if self.cfg["require_rejection"]:
-                rejected = self._check_rejection(qqq_price, nearest)
-                if not rejected:
-                    return None, None, None, None, None, None
-                signal_type = "MR_REJECTION"
+            if target >= price:
+                continue
+
+            risk = abs(stop - price)
+            reward = abs(price - target)
+            rr = reward / risk if risk > 0 else 0
+
+            return {
+                "signal": "SHORT",
+                "direction": "SHORT",
+                "mode": "mean_reversion",
+                "entry_zone": f"+{band_n}σ",
+                "entry_price": round(price, 2),
+                "stop": round(stop, 2),
+                "target": round(target, 2),
+                "target_label": target_label,
+                "risk_reward": round(rr, 2),
+                "size_scalar": size,
+                "band_level": upper,
+                "regime_action": regime_action,
+                "reason": f"Price at +{band_n}σ ({upper:.2f}) — fade SHORT toward {target_label}",
+            }
+
+        # Check lower side: price at/below -nσ → LONG
+        elif dist <= -(band_n - threshold):
+            stop = (tracker.bands[band_n + 1][1] if band_n < 4 and (band_n + 1) in tracker.bands
+                    else lower - sd * 0.5)
+
+            target_sd = band_n - TARGET_SD_MOVE
+            if target_sd <= 0:
+                target = vwap
+                target_label = "VWAP"
             else:
-                # Just proximity + stalling
-                if len(self.price_history) >= 5:
-                    recent = [p["price"] for p in list(self.price_history)[-5:]]
-                    rng = max(recent) - min(recent)
-                    if rng > prox * 2:
-                        return None, None, None, None, None, None
+                target = vwap - target_sd * sd
+                target_label = f"-{target_sd:.1f}σ"
 
-        else:
-            # -GEX node = BREAKOUT
-            # Direction = follow momentum THROUGH the node
-            signal_type = "BREAKOUT"
+            if target <= price:
+                continue
 
-            # Detect which way price is breaking through
-            if len(self.price_history) >= 4:
-                recent = [p["price"] for p in list(self.price_history)[-4:]]
-                if recent[-1] > nearest.strike and recent[0] < nearest.strike:
-                    direction = "LONG"   # Breaking up through -GEX
-                elif recent[-1] < nearest.strike and recent[0] > nearest.strike:
-                    direction = "SHORT"  # Breaking down through -GEX
-                else:
-                    return None, None, None, None, None, None
-            else:
-                return None, None, None, None, None, None
+            risk = abs(price - stop)
+            reward = abs(target - price)
+            rr = reward / risk if risk > 0 else 0
 
-        # ── DEX CONFIDENCE ───────────────────────────────────────────────
-        # DEX doesn't change direction, just adds/reduces conviction
-        dex_conf = nearest.dex_confidence(direction)
-        # Could use this for position sizing: higher confidence = bigger size
-        # For now, log it and use as a filter for weak signals
-        if dex_conf < 0.3:
-            # Very low confidence — DEX strongly disagrees, skip
-            return None, None, None, None, None, None
+            return {
+                "signal": "LONG",
+                "direction": "LONG",
+                "mode": "mean_reversion",
+                "entry_zone": f"-{band_n}σ",
+                "entry_price": round(price, 2),
+                "stop": round(stop, 2),
+                "target": round(target, 2),
+                "target_label": target_label,
+                "risk_reward": round(rr, 2),
+                "size_scalar": size,
+                "band_level": lower,
+                "regime_action": regime_action,
+                "reason": f"Price at -{band_n}σ ({lower:.2f}) — fade LONG toward {target_label}",
+            }
 
-        # ── FIND TARGET ──────────────────────────────────────────────────
+    return {"signal": "FLAT", "reason": "Price not at any active MR band",
+            "mode": "mean_reversion", "regime_action": regime_action}
 
-        target_node = self._find_target_node(gex_engine, qqq_price, direction)
 
-        # Calculate stop and target in QQQ space
-        stop_buffer = self.cfg["stop_buffer_qqq"]
+def _eval_bo(tracker, active_bands, size, dist, price, sd, vwap, threshold, regime_action):
+    """Breakout: ride momentum through VWAP bands."""
+    for band_n in sorted(active_bands):
+        upper, lower = tracker.bands.get(band_n, (0, 0))
 
-        if direction == "LONG":
-            stop_qqq = nearest.strike - stop_buffer
-            if target_node:
-                target_qqq = target_node.strike
-            else:
-                risk = qqq_price - stop_qqq
-                target_qqq = qqq_price + risk * self.cfg["rr_ratio"]
-        else:
-            stop_qqq = nearest.strike + stop_buffer
-            if target_node:
-                target_qqq = target_node.strike
-            else:
-                risk = stop_qqq - qqq_price
-                target_qqq = qqq_price - risk * self.cfg["rr_ratio"]
+        # Breaking above +nσ → LONG breakout
+        if dist >= band_n - threshold and dist < band_n + 1:
+            stop = (tracker.bands[band_n - 1][0] if band_n > 1 and (band_n - 1) in tracker.bands
+                    else vwap)
+            target = (tracker.bands[band_n + 1][0] if band_n < 4 and (band_n + 1) in tracker.bands
+                      else upper + sd)
 
-        # Validate R:R — minimum 0.5
-        risk_amt = abs(qqq_price - stop_qqq)
-        reward_amt = abs(target_qqq - qqq_price)
-        if risk_amt <= 0 or reward_amt / risk_amt < 0.5:
-            return None, None, None, None, None, None
+            risk = abs(price - stop)
+            reward = abs(target - price)
+            rr = reward / risk if risk > 0 else 0
 
-        self.state = "ENTRY"
-        self.last_trade_time = time.time()
-        self.bars_near_node = 0
+            return {
+                "signal": "LONG",
+                "direction": "LONG",
+                "mode": "breakout",
+                "entry_zone": f"+{band_n}σ",
+                "entry_price": round(price, 2),
+                "stop": round(stop, 2),
+                "target": round(target, 2),
+                "target_label": f"+{band_n+1}σ",
+                "risk_reward": round(rr, 2),
+                "size_scalar": size,
+                "band_level": upper,
+                "regime_action": regime_action,
+                "reason": f"Breaking above +{band_n}σ ({upper:.2f}) — LONG breakout toward +{band_n+1}σ",
+            }
 
-        return signal_type, nearest, target_node, direction, stop_qqq, target_qqq, dex_conf
+        # Breaking below -nσ → SHORT breakout
+        elif dist <= -(band_n - threshold) and dist > -(band_n + 1):
+            stop = (tracker.bands[band_n - 1][1] if band_n > 1 and (band_n - 1) in tracker.bands
+                    else vwap)
+            target = (tracker.bands[band_n + 1][1] if band_n < 4 and (band_n + 1) in tracker.bands
+                      else lower - sd)
+
+            risk = abs(stop - price)
+            reward = abs(price - target)
+            rr = reward / risk if risk > 0 else 0
+
+            return {
+                "signal": "SHORT",
+                "direction": "SHORT",
+                "mode": "breakout",
+                "entry_zone": f"-{band_n}σ",
+                "entry_price": round(price, 2),
+                "stop": round(stop, 2),
+                "target": round(target, 2),
+                "target_label": f"-{band_n+1}σ",
+                "risk_reward": round(rr, 2),
+                "size_scalar": size,
+                "band_level": lower,
+                "regime_action": regime_action,
+                "reason": f"Breaking below -{band_n}σ ({lower:.2f}) — SHORT breakout toward -{band_n+1}σ",
+            }
+
+    return {"signal": "FLAT", "reason": "Price not crossing any active BO band",
+            "mode": "breakout", "regime_action": regime_action}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,22 +481,21 @@ class TradeLogger:
         with open(self.filepath, "w") as f:
             json.dump(self.trades, f, indent=2, default=str)
 
-    def log_entry(self, signal_type, direction, qqq_price, nq_price,
-                  entry_node, target_node, stop_qqq, target_qqq, ticket):
+    def log_entry(self, signal_type, direction, nq_price, entry_zone, mode,
+                  stop, target, rr, size_scalar, regime_action, ticket, vwap_at_entry):
         entry = {
             "time": datetime.now().isoformat(),
             "signal": signal_type,
             "direction": direction,
-            "qqq_price": qqq_price,
             "nq_price": nq_price,
-            "node_strike": entry_node.strike,
-            "node_gex": entry_node.gex,
-            "node_dex": entry_node.dex,
-            "node_action": entry_node.action,
-            "node_growing": entry_node.growing,
-            "target_strike": target_node.strike if target_node else None,
-            "stop_qqq": stop_qqq,
-            "target_qqq": target_qqq,
+            "entry_zone": entry_zone,
+            "mode": mode,
+            "stop": stop,
+            "target": target,
+            "rr": rr,
+            "size_scalar": size_scalar,
+            "regime_action": regime_action,
+            "vwap_at_entry": vwap_at_entry,
             "ticket": ticket,
             "status": "OPEN",
         }
@@ -358,18 +525,6 @@ class TradeLogger:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  QQQ <-> NQ CONVERSION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def qqq_to_nq(qqq_level, qqq_spot, nq_price):
-    """Convert QQQ price level to NQ equivalent."""
-    if qqq_spot <= 0:
-        return nq_price
-    ratio = nq_price / qqq_spot
-    return round(qqq_level * ratio, 2)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN BOT LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -377,35 +532,35 @@ def run_bot():
     cfg = CONFIG
 
     print("=" * 70)
-    print("  0DTE GEX HEATMAP TRADING BOT")
-    print("  Signal: Tradier (QQQ 0DTE options)")
+    print("  VWAP DEVIATION + HMM REGIME TRADING BOT")
+    print("  Signal: VWAP SD Bands + Altaris HMM Regime")
+    print("  Context: Tradier (QQQ 0DTE GEX heatmap)")
     print("  Execution: MetaTrader 5 (NAS100)")
     print("=" * 70)
-    print(f"  Strategy: MR at +GEX nodes | Breakout at -GEX nodes")
-    print(f"  Direction: GEX/DEX dealer flow")
-    print(f"  Proximity: ${cfg['proximity_qqq']:.2f}")
-    print(f"  Stop buffer: ${cfg['stop_buffer_qqq']:.2f} beyond node")
-    print(f"  Default R:R: 1:{cfg['rr_ratio']}")
+    print(f"  Mode: Mean-Reversion / Breakout (regime-driven)")
+    print(f"  Bars: {cfg['vwap_bar_sec']}s ({cfg['vwap_bar_sec']//60} min)")
     print(f"  Max positions: {cfg['max_positions']}")
+    print(f"  Lot size: {cfg['lot_size']}")
     print("=" * 70)
 
-    # Initialize
+    # Initialize components
     gex = GEXEngine()
     mt5 = MT5Executor(symbol=cfg["mt5_symbol"], lot_size=cfg["lot_size"])
-    signal = SignalEngine(cfg)
+    vwap = LiveVWAPTracker(bar_seconds=cfg["vwap_bar_sec"])
     logger = TradeLogger(os.path.join(os.path.dirname(__file__), cfg["log_file"]))
     dc = DiscordAlerts()
     tracker = DayTracker()
 
-    # Start interactive Discord bot (for !levels, !status, !heatmap, !vwap + alerts)
+    # Start interactive Discord bot
     dc_bot = GEXBot(
         gex_engine=gex,
         day_tracker=tracker,
         trade_logger=logger,
-        signal_engine=signal,
-        mt5_live=False,  # Updated after MT5 connect
+        signal_engine=None,       # No longer using GEX SignalEngine
+        mt5_live=False,
         alerts=dc,
     )
+    dc_bot.vwap_tracker = vwap    # Share VWAP tracker with bot for !status
 
     # Connect MT5
     print("\n[BOT] Connecting to MetaTrader 5...")
@@ -418,27 +573,30 @@ def run_bot():
     # Start Discord command bot in background
     dc_bot.start_background()
 
-    # Initial GEX
+    # Initial GEX (for heatmap context)
     print("[BOT] Loading 0DTE GEX heatmap...")
     gex.compute()
-    tracker.update(gex.spot, gex.nodes)  # Track initial levels
+    tracker.update(gex.spot, gex.nodes)
     if cfg["print_heatmap"]:
         gex.print_heatmap()
 
+    # HMM Regime state
+    regime = {"action": "NO_TRADE", "available": False, "reasoning": "Not fetched yet"}
+    last_regime_fetch = 0
+
     last_gex_refresh = time.time()
     last_heatmap_print = time.time()
-    last_dc_heatmap = 0  # Send first one immediately
+    last_dc_heatmap = 0
+    last_trade_time = 0
     active_ticket = None
     active_trade_idx = None
-
-    # Active trade tracking (shared with Discord bot for !status)
-    active_trade_info = None  # dict with entry details while in a trade
+    active_trade_info = None
 
     # Discord startup alert
-    mode = "LIVE (MT5)" if mt5_live else "SIGNAL-ONLY"
-    dc.bot_status("START", f"GEX Bot started in **{mode}** mode\n"
-                  f"Symbol: `{cfg['mt5_symbol']}` | Lot: `{cfg['lot_size']}`\n"
-                  f"Proximity: ${cfg['proximity_qqq']:.2f} | R:R: 1:{cfg['rr_ratio']}")
+    mode_str = "LIVE (MT5)" if mt5_live else "SIGNAL-ONLY"
+    dc.bot_status("START", f"VWAP Bot started in **{mode_str}** mode\n"
+                  f"Strategy: VWAP Deviation + HMM Regime\n"
+                  f"Symbol: `{cfg['mt5_symbol']}` | Lot: `{cfg['lot_size']}`")
 
     print("[BOT] Entering main loop... (Ctrl+C to stop)\n")
 
@@ -448,10 +606,10 @@ def run_bot():
             hour = now.hour
 
             # ── Weekend check ───────────────────────────────────────────
-            if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            if now.weekday() >= 5:
                 if now.hour == 0 and now.minute == 0 and now.second < 5:
                     print(f"[BOT] Weekend. Sleeping until Monday...")
-                time.sleep(300)  # 5 min sleep on weekends
+                time.sleep(300)
                 continue
 
             # ── Session filter ──────────────────────────────────────────
@@ -462,27 +620,24 @@ def run_bot():
                 continue
 
             try:
-                # ── Refresh GEX ─────────────────────────────────────────
+                # ── Refresh GEX (for heatmap context) ───────────────────
                 if time.time() - last_gex_refresh > cfg["gex_refresh_sec"]:
                     gex.compute()
-                    tracker.update(gex.spot, gex.nodes)  # Track levels
+                    tracker.update(gex.spot, gex.nodes)
                     last_gex_refresh = time.time()
 
-                    # Print compact update
+                    # Print compact GEX update
                     if gex.nodes:
                         nearest_above = gex.get_node_above(gex.spot)
                         nearest_below = gex.get_node_below(gex.spot)
-                        growing = gex.get_growing_nodes()
 
-                        above_str = f"${nearest_above.strike:.0f}({nearest_above.action[0]}{nearest_above.dex_bias[0]})" if nearest_above else "---"
-                        below_str = f"${nearest_below.strike:.0f}({nearest_below.action[0]}{nearest_below.dex_bias[0]})" if nearest_below else "---"
-                        grow_str = f" | GROWING: {','.join(f'${n.strike:.0f}' for n in growing[:3])}" if growing else ""
+                        above_str = f"${nearest_above.strike:.0f}({nearest_above.action[0]})" if nearest_above else "---"
+                        below_str = f"${nearest_below.strike:.0f}({nearest_below.action[0]})" if nearest_below else "---"
 
                         print(f"[GEX] {now:%H:%M:%S} QQQ ${gex.spot:.2f} | "
-                              f"Above: {above_str} Below: {below_str}{grow_str} | "
-                              f"State: {signal.state}")
+                              f"Above: {above_str} Below: {below_str}")
 
-                    # Full heatmap every 5 min (console)
+                    # Full heatmap every 5 min
                     if cfg["print_heatmap"] and time.time() - last_heatmap_print > 300:
                         gex.print_heatmap()
                         last_heatmap_print = time.time()
@@ -497,17 +652,73 @@ def run_bot():
                         )
                         last_dc_heatmap = time.time()
 
-                # ── Get QQQ price ───────────────────────────────────────
-                qqq_price = gex.get_spot()
-                if qqq_price <= 0:
+                # ── Get NQ price ────────────────────────────────────────
+                nq_price = None
+                if mt5_live:
+                    nq_bid, nq_ask = mt5.get_price()
+                    if nq_bid and nq_ask:
+                        nq_price = (nq_bid + nq_ask) / 2.0
+                else:
+                    # Signal-only: derive approximate NQ from QQQ
+                    qqq = gex.get_spot() if gex else 0
+                    if qqq > 0:
+                        nq_price = qqq * 41.5  # Rough QQQ→NQ ratio
+
+                if not nq_price or nq_price <= 0:
                     time.sleep(5)
                     continue
+
+                # ── Feed VWAP tracker ───────────────────────────────────
+                vwap.tick(nq_price)
+
+                # ── Update VWAP state for !status ───────────────────────
+                if vwap.ready:
+                    pos = vwap.price_position()
+                    levels = vwap.get_levels()
+                    dc_bot.vwap_state = {
+                        "vwap": levels["vwap"],
+                        "price": nq_price,
+                        "std_dev": levels["std_dev"],
+                        "distance_sd": pos["distance_sd"],
+                        "zone": pos["zone"],
+                        "side": pos["side"],
+                        "near_band": pos.get("near_band"),
+                        "bands": levels["band_pairs"],
+                        "bar_count": levels["bar_count"],
+                        "tick_count": levels["tick_count"],
+                        "regime_action": regime.get("action", "?"),
+                        "hmm_state": regime.get("hmm_state", "?"),
+                        "mode": DECISION_MATRIX.get(regime.get("action", "NO_TRADE"), {}).get("mode", "flat"),
+                    }
+
+                    # Print VWAP status periodically (every 30s)
+                    if int(time.time()) % 30 < 4:
+                        mode_label = dc_bot.vwap_state["mode"].upper().replace("_", " ")
+                        print(f"[VWAP] NQ {nq_price:,.2f} | VWAP {levels['vwap']:,.2f} | "
+                              f"{pos['distance_sd']:+.2f}σ ({pos['zone']}) | "
+                              f"Regime: {regime.get('action', '?')} → {mode_label}")
+
+                # ── Refresh HMM Regime ──────────────────────────────────
+                if VWAP_STRATEGY_AVAILABLE and time.time() - last_regime_fetch > cfg["regime_refresh_sec"]:
+                    try:
+                        new_regime = fetch_hmm_regime(cfg["altaris_token"])
+                        if new_regime.get("available"):
+                            old_action = regime.get("action")
+                            regime = new_regime
+                            if regime["action"] != old_action:
+                                decision = DECISION_MATRIX.get(regime["action"], {})
+                                print(f"[REGIME] {old_action} → {regime['action']} "
+                                      f"({decision.get('description', '')})")
+                        else:
+                            print(f"[REGIME] HMM unavailable: {new_regime.get('reasoning', '?')}")
+                    except Exception as e:
+                        print(f"[REGIME] Fetch error: {e}")
+                    last_regime_fetch = time.time()
 
                 # ── Daily loss limit ────────────────────────────────────
                 daily_pnl = logger.daily_pnl()
                 if daily_pnl <= cfg["max_daily_loss_usd"]:
                     print(f"[BOT] DAILY LOSS LIMIT: ${daily_pnl:.2f}. Stopping for today.")
-                    # Close any open position
                     if mt5_live and active_ticket:
                         mt5.close_trade(active_ticket)
                     break
@@ -520,43 +731,37 @@ def run_bot():
                         # Position was closed (SL/TP hit or manual close)
                         print(f"[BOT] Position {active_ticket} closed (SL/TP hit)")
 
-                        # Get close details and send Discord alert
                         if active_trade_info:
                             entry_px = active_trade_info.get("nq_price", 0)
                             direction = active_trade_info.get("direction", "?")
                             entry_time = active_trade_info.get("entry_time")
-                            node_strike = active_trade_info.get("node_strike", 0)
+                            entry_zone = active_trade_info.get("entry_zone", "?")
+                            trade_mode = active_trade_info.get("mode", "?")
 
-                            # Estimate exit price from last known price
+                            # Get close price
                             nq_bid, nq_ask = mt5.get_price()
                             exit_price = nq_bid or nq_ask or 0
 
-                            # Estimate PnL
+                            # Calculate PnL
                             if direction == "LONG":
                                 pnl_pts = exit_price - entry_px
                             else:
                                 pnl_pts = entry_px - exit_price
-                            pnl_dollar = pnl_pts * 5.0 * cfg["lot_size"]  # $5/pt for NQ
+                            pnl_dollar = pnl_pts * 5.0 * cfg["lot_size"]
 
                             # Duration
                             dur_min = 0
                             if entry_time:
                                 dur_min = (datetime.now() - entry_time).total_seconds() / 60
 
-                            # Determine exit reason
-                            stop_qqq = active_trade_info.get("stop_qqq", 0)
-                            target_qqq = active_trade_info.get("target_qqq", 0)
-                            reason = "SL/TP" if abs(pnl_pts) > 0 else "MANUAL"
-                            if pnl_pts > 0:
-                                reason = "TARGET HIT"
-                            else:
-                                reason = "STOP HIT"
+                            # Exit reason
+                            reason = "TARGET HIT" if pnl_pts > 0 else "STOP HIT"
 
                             # Log exit
                             if active_trade_idx is not None:
                                 logger.log_exit(active_trade_idx, exit_price, pnl_dollar, reason)
 
-                            # Send Discord close alert
+                            # Discord close alert
                             dc.trade_closed(
                                 direction=direction,
                                 entry_price=entry_px,
@@ -564,7 +769,8 @@ def run_bot():
                                 pnl=pnl_dollar,
                                 reason=reason,
                                 duration_min=dur_min,
-                                node_strike=node_strike,
+                                entry_zone=entry_zone,
+                                mode=trade_mode,
                             )
 
                         active_ticket = None
@@ -578,79 +784,80 @@ def run_bot():
                     time.sleep(3)
                     continue
 
-                # ── Signal evaluation ───────────────────────────────────
-                result = signal.evaluate(qqq_price, gex)
-
-                if result[0] is None:
+                # ── Cooldown check ──────────────────────────────────────
+                if time.time() - last_trade_time < cfg["cooldown_sec"]:
                     time.sleep(3)
                     continue
 
-                sig_type, entry_node, target_node, direction, stop_qqq, target_qqq, dex_conf = result
+                # ── VWAP Signal evaluation ──────────────────────────────
+                if not vwap.ready or not VWAP_STRATEGY_AVAILABLE:
+                    time.sleep(3)
+                    continue
+
+                trade = evaluate_vwap_signal(vwap, regime, cfg)
+
+                if trade.get("signal") == "FLAT":
+                    time.sleep(3)
+                    continue
 
                 # ── SIGNAL FIRED ────────────────────────────────────────
+                direction = trade["direction"]
+                entry_zone = trade["entry_zone"]
+                mode = trade["mode"]
+                stop = trade["stop"]
+                target = trade["target"]
+                rr = trade["risk_reward"]
+                size_scalar = trade["size_scalar"]
+                regime_action = trade.get("regime_action", "?")
+                reason = trade.get("reason", "")
 
-                risk_qqq = abs(qqq_price - stop_qqq)
-                reward_qqq = abs(target_qqq - qqq_price)
-                rr = reward_qqq / risk_qqq if risk_qqq > 0 else 0
-
-                target_info = f"${target_node.strike:.0f}" if target_node else f"${target_qqq:.2f}"
-                growth_tag = " [TARGET GROWING]" if (target_node and target_node.growing) else ""
-                conf_bar = "!" * int(dex_conf * 10)
-                dex_label = f"DEX conf: {dex_conf:.0%} {conf_bar}"
+                mode_label = "MEAN REVERSION" if mode == "mean_reversion" else "BREAKOUT"
 
                 print(f"\n{'*'*70}")
-                print(f"  SIGNAL: {sig_type} | {direction} | {dex_label}")
-                print(f"  Node: ${entry_node.strike:.0f} | "
-                      f"GEX: {entry_node.gex:+,.0f} | DEX: {entry_node.dex:+,.0f} "
-                      f"(bias: {entry_node.dex_bias})")
-                print(f"  QQQ: ${qqq_price:.2f} | "
-                      f"Stop: ${stop_qqq:.2f} | Target: {target_info}{growth_tag}")
-                print(f"  Risk: ${risk_qqq:.2f} | Reward: ${reward_qqq:.2f} | R:R = 1:{rr:.1f}")
+                print(f"  SIGNAL: {mode_label} | {direction}")
+                print(f"  Zone: {entry_zone} | Regime: {regime_action}")
+                print(f"  NQ: {nq_price:,.2f} | VWAP: {vwap.vwap:,.2f} | {vwap.price_position()['distance_sd']:+.2f}σ")
+                print(f"  Stop: {stop:,.2f} | Target: {target:,.2f}")
+                print(f"  R:R = 1:{rr:.1f} | Size: {size_scalar:.0%}")
+                print(f"  {reason}")
                 print(f"{'*'*70}")
 
                 # ── Execute on MT5 ──────────────────────────────────────
                 executed = False
-                ticket = None
-                nq_price_exec = None
+                ticket_id = None
 
                 if mt5_live:
                     nq_bid, nq_ask = mt5.get_price()
                     if nq_bid and nq_ask:
-                        nq_price_exec = nq_ask if direction == "LONG" else nq_bid
+                        exec_price = nq_ask if direction == "LONG" else nq_bid
 
-                        # Convert QQQ levels to NQ
-                        nq_stop = qqq_to_nq(stop_qqq, qqq_price, nq_price_exec)
-                        nq_target = qqq_to_nq(target_qqq, qqq_price, nq_price_exec)
-
-                        print(f"  NQ: {nq_price_exec:.2f} | SL: {nq_stop:.2f} | TP: {nq_target:.2f}")
-
-                        comment = f"GEX_{entry_node.strike:.0f}_{sig_type[:2]}_{direction[0]}"
-                        ticket = mt5.open_trade(direction, stop_loss=nq_stop,
-                                                take_profit=nq_target, comment=comment)
-                        if ticket:
-                            active_ticket = ticket
+                        comment = f"VWAP_{entry_zone}_{mode[:2].upper()}_{direction[0]}"
+                        ticket_id = mt5.open_trade(direction, stop_loss=stop,
+                                                    take_profit=target, comment=comment)
+                        if ticket_id:
+                            active_ticket = ticket_id
                             active_trade_idx = logger.log_entry(
-                                sig_type, direction, qqq_price, nq_price_exec,
-                                entry_node, target_node, stop_qqq, target_qqq, ticket)
-                            print(f"  [EXECUTED] Ticket: {ticket}")
+                                f"VWAP_{mode_label[:2]}", direction, exec_price,
+                                entry_zone, mode, stop, target, rr, size_scalar,
+                                regime_action, ticket_id, vwap.vwap)
+                            print(f"  [EXECUTED] Ticket: {ticket_id}")
                             executed = True
+                            last_trade_time = time.time()
 
                             # Track active trade for !status and close alerts
                             active_trade_info = {
-                                "ticket": ticket,
-                                "signal": sig_type,
+                                "ticket": ticket_id,
                                 "direction": direction,
-                                "qqq_price": qqq_price,
-                                "nq_price": nq_price_exec,
-                                "nq_stop": nq_stop,
-                                "nq_target": nq_target,
-                                "stop_qqq": stop_qqq,
-                                "target_qqq": target_qqq,
-                                "node_strike": entry_node.strike,
-                                "node_gex": entry_node.gex,
-                                "dex_conf": dex_conf,
-                                "entry_time": datetime.now(),
+                                "nq_price": exec_price,
+                                "stop": stop,
+                                "target": target,
+                                "entry_zone": entry_zone,
+                                "mode": mode,
+                                "regime_action": regime_action,
+                                "vwap_at_entry": vwap.vwap,
+                                "size_scalar": size_scalar,
                                 "rr": rr,
+                                "entry_time": datetime.now(),
                             }
                             dc_bot.active_trade = active_trade_info
                         else:
@@ -659,32 +866,47 @@ def run_bot():
                         print(f"  [ERROR] No NQ price available")
                 else:
                     # Signal-only mode
-                    active_trade_idx = logger.log_entry(sig_type, direction, qqq_price, 0,
-                                    entry_node, target_node, stop_qqq, target_qqq, 0)
+                    active_trade_idx = logger.log_entry(
+                        f"VWAP_{mode_label[:2]}", direction, nq_price,
+                        entry_zone, mode, stop, target, rr, size_scalar,
+                        regime_action, 0, vwap.vwap)
                     print(f"  [SIGNAL ONLY] Not executed (MT5 not connected)")
+                    last_trade_time = time.time()
 
-                    # Track for !status even in signal-only mode
                     active_trade_info = {
                         "ticket": None,
-                        "signal": sig_type,
                         "direction": direction,
-                        "qqq_price": qqq_price,
-                        "nq_price": 0,
-                        "stop_qqq": stop_qqq,
-                        "target_qqq": target_qqq,
-                        "node_strike": entry_node.strike,
-                        "node_gex": entry_node.gex,
-                        "dex_conf": dex_conf,
-                        "entry_time": datetime.now(),
+                        "nq_price": nq_price,
+                        "stop": stop,
+                        "target": target,
+                        "entry_zone": entry_zone,
+                        "mode": mode,
+                        "regime_action": regime_action,
+                        "vwap_at_entry": vwap.vwap,
+                        "size_scalar": size_scalar,
                         "rr": rr,
+                        "entry_time": datetime.now(),
                     }
                     dc_bot.active_trade = active_trade_info
 
                 # ── Discord alert ───────────────────────────────────────
                 dc.signal_alert(
-                    sig_type, direction, qqq_price, entry_node,
-                    target_node, stop_qqq, target_qqq, dex_conf,
-                    executed=executed, ticket=ticket, nq_price=nq_price_exec
+                    direction=direction,
+                    mode=mode,
+                    entry_zone=entry_zone,
+                    nq_price=nq_price,
+                    vwap_level=vwap.vwap,
+                    distance_sd=vwap.price_position()["distance_sd"],
+                    stop=stop,
+                    target=target,
+                    target_label=trade.get("target_label", "?"),
+                    rr=rr,
+                    size_scalar=size_scalar,
+                    regime_action=regime_action,
+                    hmm_state=regime.get("hmm_state", "?"),
+                    executed=executed,
+                    ticket=ticket_id,
+                    reason=reason,
                 )
 
                 print()
@@ -692,6 +914,8 @@ def run_bot():
 
             except Exception as e:
                 print(f"[BOT] Error in loop: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(10)
 
     except KeyboardInterrupt:
@@ -718,7 +942,6 @@ def run_bot():
             wins = sum(1 for p in pnls if p > 0)
             losses = sum(1 for p in pnls if p <= 0)
 
-            # Get final GEX node snapshot for level recap
             nearest_nodes = gex.get_nearest_nodes(gex.spot, 10) if gex.nodes else None
             if nearest_nodes:
                 nearest_nodes.sort(key=lambda n: n.strike, reverse=True)

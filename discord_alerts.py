@@ -1,13 +1,13 @@
 """
-discord_alerts.py - Discord Alerts for GEX Bot
-================================================
+discord_alerts.py - Discord Alerts for VWAP Trading Bot
+========================================================
 Sends rich embed alerts via the GEXBot's connection.
 Does NOT create its own bot — uses the shared bot instance.
 
 Alerts:
-  - Signal fires (entry)
+  - Signal fires (VWAP entry — MR or BO)
   - Trade closes (exit with P&L)
-  - GEX heatmap update (periodic)
+  - GEX heatmap update (periodic context)
   - Daily summary
   - Bot status (start/stop)
 """
@@ -58,85 +58,102 @@ class DiscordAlerts:
             print(f"[DC] Send error: {e}")
             return False
 
-    def signal_alert(self, sig_type, direction, qqq_price, entry_node,
-                     target_node, stop_qqq, target_qqq, dex_conf,
-                     executed=False, ticket=None, nq_price=None):
-        """Send entry signal alert."""
+    def signal_alert(self, direction, mode, entry_zone, nq_price, vwap_level,
+                     distance_sd, stop, target, target_label, rr, size_scalar,
+                     regime_action, hmm_state, executed=False, ticket=None,
+                     reason=""):
+        """
+        Send VWAP entry signal alert.
+
+        Shows: direction, mode (MR/BO), entry zone (±nσ), VWAP level,
+        stop/target, R:R, HMM regime, size scalar.
+        """
         color = 0x00FF88 if direction == "LONG" else 0xFF4444
-
-        risk = abs(qqq_price - stop_qqq)
-        reward = abs(target_qqq - qqq_price)
-        rr = reward / risk if risk > 0 else 0
-
-        target_str = f"${target_node.strike:.0f}" if target_node else f"${target_qqq:.2f}"
-        growth_tag = " GROWING" if (target_node and target_node.growing) else ""
-
-        conf_dots = round(dex_conf * 10)
-        conf_bar = "🟢" * conf_dots + "⚫" * (10 - conf_dots)
+        mode_label = "MEAN REVERSION" if mode == "mean_reversion" else "BREAKOUT"
+        mode_emoji = "📐" if mode == "mean_reversion" else "🚀"
 
         status = "EXECUTED" if executed else "SIGNAL ONLY"
         status_emoji = "🟢" if executed else "🔵"
 
+        # Size bar
+        size_dots = round(size_scalar * 10)
+        size_bar = "🟩" * size_dots + "⬛" * (10 - size_dots)
+
+        risk = abs(nq_price - stop)
+        reward = abs(target - nq_price)
+
         embed = {
-            "title": f"{status_emoji} {sig_type} | {direction}",
+            "title": f"{status_emoji} {mode_emoji} {mode_label} | {direction} | {entry_zone}",
             "color": color,
             "fields": [
                 {
-                    "name": "Entry Node",
-                    "value": f"**${entry_node.strike:.0f}** ({entry_node.type})\n"
-                             f"GEX: `{entry_node.gex:+,.0f}`\n"
-                             f"DEX: `{entry_node.dex:+,.0f}` (bias: {entry_node.dex_bias})",
+                    "name": "📍 Entry Zone",
+                    "value": f"**{entry_zone}** at `{nq_price:,.2f}`\n"
+                             f"VWAP: `{vwap_level:,.2f}`\n"
+                             f"Distance: **{distance_sd:+.2f}σ**",
                     "inline": True,
                 },
                 {
-                    "name": "Levels (QQQ)",
-                    "value": f"Entry: **${qqq_price:.2f}**\n"
-                             f"Stop: ${stop_qqq:.2f}\n"
-                             f"Target: {target_str}{growth_tag}",
-                    "inline": True,
-                },
-                {
-                    "name": "Risk",
-                    "value": f"Risk: ${risk:.2f} | Reward: ${reward:.2f}\n"
+                    "name": "🎯 Levels",
+                    "value": f"Stop: `{stop:,.2f}`\n"
+                             f"Target: `{target:,.2f}` ({target_label})\n"
                              f"R:R = **1:{rr:.1f}**",
                     "inline": True,
                 },
                 {
-                    "name": "DEX Confidence",
-                    "value": f"{dex_conf:.0%} {conf_bar}",
-                    "inline": False,
+                    "name": "📊 Risk",
+                    "value": f"Risk: `{risk:,.2f}` pts\n"
+                             f"Reward: `{reward:,.2f}` pts",
+                    "inline": True,
+                },
+                {
+                    "name": "🧠 HMM Regime",
+                    "value": f"**{regime_action}** (HMM: {hmm_state})\n"
+                             f"Mode: {mode_label}",
+                    "inline": True,
+                },
+                {
+                    "name": "📏 Size",
+                    "value": f"**{size_scalar:.0%}** {size_bar}",
+                    "inline": True,
                 },
             ],
             "footer": {
                 "text": f"{status} | {datetime.now():%H:%M:%S ET}"
-                        + (f" | Ticket: {ticket}" if ticket else "")
-                        + (f" | NQ: {nq_price:.2f}" if nq_price else ""),
+                        + (f" | Ticket: {ticket}" if ticket else ""),
             },
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+        if reason:
+            embed["description"] = f"*{reason}*"
+
         return self._send(embed)
 
     def trade_closed(self, direction, entry_price, exit_price, pnl,
-                     reason, duration_min=0, node_strike=0):
-        """Send trade close alert."""
+                     reason, duration_min=0, entry_zone="?", mode="?"):
+        """
+        Send trade close alert with VWAP context.
+        Shows: direction, P&L, entry→exit, duration, entry zone, mode.
+        """
         color = 0x00FF88 if pnl > 0 else 0xFF4444
         emoji = "💰" if pnl > 0 else "💔"
+        mode_label = "MR" if mode == "mean_reversion" else "BO" if mode == "breakout" else mode.upper()
 
         embed = {
             "title": f"{emoji} Trade Closed | {direction} | {reason}",
             "color": color,
             "fields": [
                 {
-                    "name": "Result",
+                    "name": "💵 Result",
                     "value": f"P&L: **${pnl:+,.2f}**\n"
-                             f"Entry: ${entry_price:.2f} -> Exit: ${exit_price:.2f}",
+                             f"Entry: `{entry_price:,.2f}` → Exit: `{exit_price:,.2f}`",
                     "inline": True,
                 },
                 {
-                    "name": "Details",
-                    "value": f"Node: ${node_strike:.0f}\n"
-                             f"Duration: {duration_min:.0f}min\n"
+                    "name": "📋 Details",
+                    "value": f"Zone: **{entry_zone}** ({mode_label})\n"
+                             f"Duration: **{duration_min:.0f}min**\n"
                              f"Exit: {reason}",
                     "inline": True,
                 },
@@ -195,7 +212,6 @@ class DiscordAlerts:
         pnls = []
         rr_ratios = []
         signal_stats = {}
-        node_stats = {}
 
         if today_trades:
             for t in today_trades:
@@ -204,32 +220,22 @@ class DiscordAlerts:
                     continue
                 pnls.append(pnl)
 
-                entry = t.get("qqq_price", 0)
-                stop = t.get("stop_qqq", 0)
-                risk = abs(entry - stop) if stop else 0
-                if risk > 0:
-                    rr_ratios.append(pnl / risk)
+                # Use R:R from trade log
+                rr = t.get("rr", 0)
+                if rr:
+                    rr_ratios.append(rr)
 
                 sig = t.get("signal", "UNKNOWN")
-                if sig not in signal_stats:
-                    signal_stats[sig] = {"wins": 0, "losses": 0, "pnl": 0, "count": 0}
-                signal_stats[sig]["count"] += 1
-                signal_stats[sig]["pnl"] += pnl
+                zone = t.get("entry_zone", "?")
+                key = f"{sig} @ {zone}"
+                if key not in signal_stats:
+                    signal_stats[key] = {"wins": 0, "losses": 0, "pnl": 0, "count": 0}
+                signal_stats[key]["count"] += 1
+                signal_stats[key]["pnl"] += pnl
                 if pnl > 0:
-                    signal_stats[sig]["wins"] += 1
+                    signal_stats[key]["wins"] += 1
                 else:
-                    signal_stats[sig]["losses"] += 1
-
-                node_k = f"${t.get('node_strike', 0):.0f}"
-                if node_k not in node_stats:
-                    node_stats[node_k] = {"wins": 0, "losses": 0, "pnl": 0,
-                                          "count": 0, "gex": t.get("node_gex", 0)}
-                node_stats[node_k]["count"] += 1
-                node_stats[node_k]["pnl"] += pnl
-                if pnl > 0:
-                    node_stats[node_k]["wins"] += 1
-                else:
-                    node_stats[node_k]["losses"] += 1
+                    signal_stats[key]["losses"] += 1
 
         gross_wins = sum(p for p in pnls if p > 0)
         gross_losses = abs(sum(p for p in pnls if p < 0))
@@ -269,7 +275,7 @@ class DiscordAlerts:
                 {"name": "🔥 Streaks", "value": f"Win: **{max_win_streak}** | Loss: **{max_loss_streak}**", "inline": True},
                 {"name": "🔢 Total Trades", "value": f"**{trades_today}**", "inline": True},
             ],
-            "footer": {"text": f"GEX Bot • {datetime.now():%Y-%m-%d}"},
+            "footer": {"text": f"VWAP Bot • {datetime.now():%Y-%m-%d}"},
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -277,7 +283,7 @@ class DiscordAlerts:
             sig_lines = []
             for sig, st in sorted(signal_stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
                 s_wr = st["wins"] / st["count"] * 100 if st["count"] > 0 else 0
-                sig_lines.append(f"`{sig:16s}` {st['count']}T | {st['wins']}W/{st['losses']}L ({s_wr:.0f}%) | ${st['pnl']:+,.2f}")
+                sig_lines.append(f"`{sig:20s}` {st['count']}T | {st['wins']}W/{st['losses']}L ({s_wr:.0f}%) | ${st['pnl']:+,.2f}")
             scorecard["fields"].append({"name": "📋 Signal Breakdown", "value": "\n".join(sig_lines), "inline": False})
 
         self._send(scorecard)
@@ -289,15 +295,13 @@ class DiscordAlerts:
                 if t.get("status") != "CLOSED":
                     continue
                 pnl = t.get("pnl", 0)
-                node = t.get("node_strike", 0)
-                entry_px = t.get("qqq_price", 0)
-                stop = t.get("stop_qqq", 0)
-                risk = abs(entry_px - stop) if stop else 0
-                actual_r = pnl / risk if risk > 0 else 0
+                zone = t.get("entry_zone", "?")
+                mode = t.get("mode", "?")
+                mode_short = "MR" if mode == "mean_reversion" else "BO" if mode == "breakout" else mode[:2].upper()
                 result_emoji = "✅" if pnl > 0 else "❌"
                 trade_lines.append(
-                    f"{result_emoji} `#{i}` **{t.get('signal','?')[:6]}** {t.get('direction','?')} @ ${node:.0f}\n"
-                    f"   ${entry_px:.2f} → ${t.get('exit_price', 0):.2f} | **${pnl:+,.2f}** ({actual_r:+.1f}R)"
+                    f"{result_emoji} `#{i}` **{mode_short}** {t.get('direction','?')} @ {zone}\n"
+                    f"   {t.get('nq_price', 0):,.2f} → {t.get('exit_price', 0):,.2f} | **${pnl:+,.2f}**"
                 )
             if trade_lines:
                 trade_text = "\n".join(trade_lines)
@@ -308,20 +312,11 @@ class DiscordAlerts:
 
         # Level recap
         level_lines = []
-        if node_stats:
-            level_lines.append("**Traded Levels:**")
-            for strike, ns in sorted(node_stats.items(), key=lambda x: x[1]["pnl"], reverse=True):
-                n_wr = ns["wins"] / ns["count"] * 100 if ns["count"] > 0 else 0
-                gex_sign = "+" if ns.get("gex", 0) > 0 else "-"
-                level_lines.append(f"{'🟢' if ns['pnl'] > 0 else '🔴'} **{strike}** ({gex_sign}GEX) | {ns['count']}T ({n_wr:.0f}%) | **${ns['pnl']:+,.2f}**")
-
         if node_recap:
-            level_lines.append("\n**End-of-Day GEX Levels:**")
+            level_lines.append("**End-of-Day GEX Levels:**")
             for n in node_recap[:10]:
                 sign = "+" if n.gex > 0 else ""
-                node_key = f"${n.strike:.0f}"
-                traded_tag = f" → {node_stats[node_key]['wins']}W/{node_stats[node_key]['losses']}L" if node_key in node_stats else ""
-                level_lines.append(f"`{node_key:>6s}` {n.type[:3]} | GEX:`{sign}{n.gex:>12,.0f}` | {n.action} {n.dex_bias}{traded_tag}")
+                level_lines.append(f"`${n.strike:>6.0f}` {n.type[:3]} | GEX:`{sign}{n.gex:>12,.0f}` | {n.action} {n.dex_bias}")
 
         if level_lines:
             level_text = "\n".join(level_lines)
@@ -340,7 +335,7 @@ class DiscordAlerts:
         embed = {
             "title": f"{emojis.get(status, 'ℹ️')} Bot {status}",
             "color": colors.get(status, 0x5865F2),
-            "description": message or f"GEX Bot {status.lower()} at {datetime.now():%H:%M:%S}",
+            "description": message or f"VWAP Bot {status.lower()} at {datetime.now():%H:%M:%S}",
             "timestamp": datetime.utcnow().isoformat(),
         }
 

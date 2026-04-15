@@ -3,8 +3,8 @@ discord_bot.py - Interactive Discord Bot with Commands
 =======================================================
 Runs alongside the main trading loop in a background thread.
 Responds to commands:
-  !levels   - Current + historical GEX levels for the day
-  !status   - Bot status, daily P&L, active trade info
+  !levels   - VWAP bands + GEX nodes
+  !status   - Bot status, VWAP position, active trade info
   !heatmap  - Current GEX heatmap snapshot
   !vwap     - VWAP deviation strategy overview + backtest stats
 
@@ -129,7 +129,7 @@ class DayTracker:
 
 
 class GEXBot(commands.Bot):
-    """Discord bot with GEX commands. Shares state with the trading loop."""
+    """Discord bot with VWAP + GEX commands. Shares state with the trading loop."""
 
     def __init__(self, gex_engine=None, day_tracker=None, trade_logger=None,
                  signal_engine=None, mt5_live=False, alerts=None):
@@ -143,7 +143,9 @@ class GEXBot(commands.Bot):
         self.signal_engine = signal_engine
         self.mt5_live = mt5_live
         self.alerts = alerts
-        self.active_trade = None  # Set by bot.py when a trade is opened/closed
+        self.active_trade = None      # Set by bot.py when a trade is opened/closed
+        self.vwap_tracker = None      # Set by bot.py — LiveVWAPTracker instance
+        self.vwap_state = None        # Set by bot.py on each tick — dict with VWAP info
         self._thread = None
         self._loop = None
         self._ready_event = threading.Event()
@@ -189,96 +191,88 @@ class GEXBot(commands.Bot):
 
     # ── !levels ─────────────────────────────────────────────────────────
     async def _cmd_levels(self, ctx):
-        """Show all current and historical GEX levels for today."""
-        if not self.gex or not self.tracker:
-            await ctx.send("⚠️ GEX engine not connected.")
-            return
+        """Show VWAP bands + active GEX levels."""
+        parts = []
 
-        active, historical = self.tracker.get_all_levels(self.gex.nodes)
-        spot = self.gex.spot
+        # ── VWAP Bands ──
+        if self.vwap_state:
+            vs = self.vwap_state
+            price = vs.get("price", 0)
+            vwap_val = vs.get("vwap", 0)
+            dist = vs.get("distance_sd", 0)
+            bands = vs.get("bands", {})
 
-        # ── Active Levels ──
-        active_lines = []
-        for lv in active:
-            gex_sign = lv["gex_sign"]
-            growth = " 📈" if lv.get("was_growing") else ""
-            change = lv["gex_change_pct"]
-            change_str = f" ({change:+.0f}%)" if abs(change) > 5 else ""
+            vwap_lines = []
+            vwap_lines.append(f"**VWAP:** `{vwap_val:,.2f}` | **NQ:** `{price:,.2f}` | **{dist:+.2f}σ** ({vs.get('side', '?')})")
+            vwap_lines.append("")
 
-            # Distance from spot
-            dist = lv["strike"] - spot
-            dist_str = f"{dist:+.2f}" if dist != 0 else "ATM"
+            # Band table
+            vwap_lines.append(f"{'Band':<8} {'Lower':>12} {'Upper':>12}")
+            vwap_lines.append(f"{'─'*36}")
 
-            # Spot marker
-            spot_marker = " ◀ SPOT" if abs(dist) < 0.50 else ""
+            for n in range(1, 5):
+                bp = bands.get(n, bands.get(str(n), {}))
+                lower = bp.get("lower", 0)
+                upper = bp.get("upper", 0)
 
-            active_lines.append(
-                f"`${lv['strike']:>6.0f}` {lv['type'][:3]} | "
-                f"{gex_sign}GEX `{lv['last_gex']:>+13,.0f}`{change_str} | "
-                f"{lv['action']} → {lv['dex_bias']}{growth}{spot_marker}"
-            )
+                # Mark current price position
+                marker = ""
+                if abs(dist) >= n - 0.15 and abs(dist) < n + 0.85:
+                    marker = " ◀"
 
-        # ── Historical Levels ──
-        hist_lines = []
-        for lv in historical:
-            dur = lv["duration_min"]
-            first_t = lv["first_seen"].strftime("%H:%M")
-            last_t = lv["last_seen"].strftime("%H:%M")
-            change = lv["gex_change_pct"]
+                vwap_lines.append(f"`±{n}σ`    `{lower:>12,.2f}` `{upper:>12,.2f}`{marker}")
 
-            hist_lines.append(
-                f"`${lv['strike']:>6.0f}` {lv['type'][:3]} | "
-                f"Peak: `{lv['max_gex']:>12,.0f}` | "
-                f"{lv['action']} | {first_t}→{last_t} ({dur:.0f}m)"
-            )
+            # Regime info
+            regime = vs.get("regime_action", "?")
+            mode = vs.get("mode", "?").upper().replace("_", " ")
+            hmm = vs.get("hmm_state", "?")
+            vwap_lines.append(f"\n**Regime:** {regime} → {mode} | HMM: {hmm}")
 
-        # Build embed
-        desc_parts = []
-        if active_lines:
-            desc_parts.append(f"**🟢 Active Levels** ({len(active_lines)})\n" +
-                              "\n".join(active_lines))
+            parts.append("**📐 VWAP Bands**\n" + "\n".join(vwap_lines))
         else:
-            desc_parts.append("**🟢 Active Levels**\nNo active nodes")
+            parts.append("**📐 VWAP Bands**\n*VWAP tracker not ready yet*")
 
-        if hist_lines:
-            desc_parts.append(f"\n**⚪ Historical Levels** ({len(hist_lines)})\n" +
-                              "\n".join(hist_lines))
+        # ── GEX Nodes (context) ──
+        if self.gex and self.tracker:
+            active, _ = self.tracker.get_all_levels(self.gex.nodes)
+            spot = self.gex.spot
 
-        desc = "\n".join(desc_parts)
+            if active:
+                gex_lines = []
+                for lv in active[:8]:
+                    gex_sign = lv["gex_sign"]
+                    dist_qqq = lv["strike"] - spot
+                    dist_str = f"{dist_qqq:+.2f}" if dist_qqq != 0 else "ATM"
+                    spot_marker = " ◀" if abs(dist_qqq) < 0.50 else ""
+
+                    gex_lines.append(
+                        f"`${lv['strike']:>6.0f}` {lv['type'][:3]} | "
+                        f"{gex_sign}GEX `{lv['last_gex']:>+13,.0f}` | "
+                        f"{lv['action']} → {lv['dex_bias']}{spot_marker}"
+                    )
+
+                parts.append(f"\n**🗺️ GEX Context** (QQQ ${spot:.2f})\n" + "\n".join(gex_lines))
+
+        desc = "\n".join(parts)
         if len(desc) > 3900:
             desc = desc[:3900] + "\n..."
 
         embed = discord.Embed(
-            title=f"🗺️ GEX Levels — {datetime.now():%b %d} | QQQ ${spot:.2f}",
+            title=f"📊 Levels — {datetime.now():%b %d %H:%M}",
             description=desc,
             color=0x5865F2,
             timestamp=datetime.utcnow(),
         )
 
-        total = len(active) + len(historical)
-        embed.set_footer(text=f"{len(active)} active | {len(historical)} expired | "
-                              f"{total} total today")
-
         await ctx.send(embed=embed)
 
     # ── !status ─────────────────────────────────────────────────────────
     async def _cmd_status(self, ctx):
-        """Show current bot status, daily P&L, active trade, and state."""
+        """Show current bot status, VWAP position, active trade, and state."""
         mode = "🟢 LIVE" if self.mt5_live else "🔵 SIGNAL-ONLY"
-        state = self.signal_engine.state if self.signal_engine else "UNKNOWN"
-        spot = self.gex.spot if self.gex else 0
 
         daily_pnl = self.logger.daily_pnl() if self.logger else 0
         daily_trades = self.logger.daily_trades() if self.logger else 0
-
-        # Node info
-        nodes_str = "No nodes loaded"
-        if self.gex and self.gex.nodes:
-            above = self.gex.get_node_above(spot)
-            below = self.gex.get_node_below(spot)
-            above_str = f"${above.strike:.0f} ({above.action})" if above else "—"
-            below_str = f"${below.strike:.0f} ({below.action})" if below else "—"
-            nodes_str = f"Above: {above_str}\nBelow: {below_str}"
 
         embed = discord.Embed(
             title="📊 Bot Status",
@@ -286,18 +280,43 @@ class GEXBot(commands.Bot):
             timestamp=datetime.utcnow(),
         )
         embed.add_field(name="Mode", value=mode, inline=True)
-        embed.add_field(name="State", value=f"`{state}`", inline=True)
-        embed.add_field(name="QQQ", value=f"${spot:.2f}", inline=True)
         embed.add_field(name="Daily P&L", value=f"**${daily_pnl:+,.2f}**", inline=True)
         embed.add_field(name="Trades Today", value=f"{daily_trades}", inline=True)
-        embed.add_field(name="Nearest Nodes", value=nodes_str, inline=False)
+
+        # ── VWAP Position ──
+        if self.vwap_state:
+            vs = self.vwap_state
+            price = vs.get("price", 0)
+            vwap_val = vs.get("vwap", 0)
+            dist = vs.get("distance_sd", 0)
+            zone = vs.get("zone", "?")
+            regime = vs.get("regime_action", "?")
+            hmm = vs.get("hmm_state", "?")
+            mode_str = vs.get("mode", "flat").upper().replace("_", " ")
+            near = vs.get("near_band", "")
+
+            position_text = (
+                f"NQ: **{price:,.2f}** | VWAP: **{vwap_val:,.2f}**\n"
+                f"Position: **{dist:+.2f}σ** ({zone})"
+            )
+            if near:
+                position_text += f" — near **{near}**"
+
+            embed.add_field(name="📐 VWAP Position", value=position_text, inline=False)
+
+            regime_text = f"**{regime}** → {mode_str} | HMM: {hmm}"
+            embed.add_field(name="🧠 Regime", value=regime_text, inline=False)
+        else:
+            embed.add_field(name="📐 VWAP", value="*Tracker warming up...*", inline=False)
 
         # ── Active Trade Info ──
         if self.active_trade:
             t = self.active_trade
             direction = t.get("direction", "?")
             dir_emoji = "🟢" if direction == "LONG" else "🔴"
-            signal = t.get("signal", "?")
+            entry_zone = t.get("entry_zone", "?")
+            trade_mode = t.get("mode", "?")
+            mode_label = "MR" if trade_mode == "mean_reversion" else "BO" if trade_mode == "breakout" else trade_mode
             entry_time = t.get("entry_time")
 
             # Duration
@@ -308,21 +327,12 @@ class GEXBot(commands.Bot):
                 dur_sec = int(elapsed % 60)
                 dur_str = f"{dur_min}m {dur_sec}s"
 
-            # Trade details text
             trade_lines = []
-            trade_lines.append(f"{dir_emoji} **{direction}** via `{signal}`")
-            trade_lines.append(f"Node: **${t.get('node_strike', 0):.0f}** (GEX: `{t.get('node_gex', 0):+,.0f}`)")
-
-            if t.get("nq_price"):
-                trade_lines.append(f"NQ Entry: **{t['nq_price']:.2f}**")
-                if t.get("nq_stop"):
-                    trade_lines.append(f"NQ Stop: `{t['nq_stop']:.2f}` | NQ Target: `{t['nq_target']:.2f}`")
-            else:
-                trade_lines.append(f"QQQ Entry: **${t.get('qqq_price', 0):.2f}**")
-                trade_lines.append(f"QQQ Stop: `${t.get('stop_qqq', 0):.2f}` | Target: `${t.get('target_qqq', 0):.2f}`")
-
-            trade_lines.append(f"R:R = **1:{t.get('rr', 0):.1f}** | DEX Conf: **{t.get('dex_conf', 0):.0%}**")
-            trade_lines.append(f"Duration: **{dur_str}**")
+            trade_lines.append(f"{dir_emoji} **{direction}** | **{mode_label}** at **{entry_zone}**")
+            trade_lines.append(f"Entry: **{t.get('nq_price', 0):,.2f}** | VWAP: `{t.get('vwap_at_entry', 0):,.2f}`")
+            trade_lines.append(f"Stop: `{t.get('stop', 0):,.2f}` | Target: `{t.get('target', 0):,.2f}`")
+            trade_lines.append(f"R:R = **1:{t.get('rr', 0):.1f}** | Size: **{t.get('size_scalar', 0):.0%}**")
+            trade_lines.append(f"Regime: {t.get('regime_action', '?')} | Duration: **{dur_str}**")
 
             if t.get("ticket"):
                 trade_lines.append(f"Ticket: `{t['ticket']}`")
@@ -339,8 +349,9 @@ class GEXBot(commands.Bot):
                 inline=False,
             )
 
-        if self.gex and self.gex.last_update:
-            embed.set_footer(text=f"Last GEX refresh: {self.gex.last_update:%H:%M:%S}")
+        if self.vwap_state:
+            embed.set_footer(text=f"Ticks: {self.vwap_state.get('tick_count', 0)} | "
+                                  f"Bars: {self.vwap_state.get('bar_count', 0)}")
 
         await ctx.send(embed=embed)
 
