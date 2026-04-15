@@ -345,3 +345,8 @@ class DiscordAlerts:
         }
 
         return self._send(embed)
+
+    def shutdown(self):
+        """Clean shutdown — disable alerts."""
+        self.enabled = False
+        self._channel = None

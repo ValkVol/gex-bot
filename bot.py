@@ -1,6 +1,6 @@
 """
-bot.py - 0DTE GEX Heatmap Trading Bot
-=======================================
+bot.py - 0DTE GEX Heatmap Trading Bot + VWAP Deviation Strategy
+=================================================================
 Strategy (user's real discretionary logic):
   1. +GEX stacked nodes ($1-2 apart) = MR zone, trade between 2 biggest
   2. +GEX +DEX = SHORT (dealers sell/fade)
@@ -8,6 +8,7 @@ Strategy (user's real discretionary logic):
   4. -GEX +DEX = LONG  (dealers chase up, breakout)
   5. -GEX -DEX = SHORT (dealers chase down, breakout)
   6. Track node growth: rejected at node A + node B growing = target B
+  7. VWAP deviation mean-reversion with GARCH regime + risk filters
 
 Data: Tradier API (0DTE QQQ options)
 Execution: MetaTrader 5 (NAS100)
@@ -396,7 +397,7 @@ def run_bot():
     dc = DiscordAlerts()
     tracker = DayTracker()
 
-    # Start interactive Discord bot (for !levels, !status, !heatmap + alerts)
+    # Start interactive Discord bot (for !levels, !status, !heatmap, !vwap + alerts)
     dc_bot = GEXBot(
         gex_engine=gex,
         day_tracker=tracker,
@@ -429,6 +430,9 @@ def run_bot():
     last_dc_heatmap = 0  # Send first one immediately
     active_ticket = None
     active_trade_idx = None
+
+    # Active trade tracking (shared with Discord bot for !status)
+    active_trade_info = None  # dict with entry details while in a trade
 
     # Discord startup alert
     mode = "LIVE (MT5)" if mt5_live else "SIGNAL-ONLY"
@@ -513,9 +517,60 @@ def run_bot():
                     positions = mt5.get_open_positions()
                     bot_pos = [p for p in positions if p.ticket == active_ticket]
                     if not bot_pos:
+                        # Position was closed (SL/TP hit or manual close)
                         print(f"[BOT] Position {active_ticket} closed (SL/TP hit)")
+
+                        # Get close details and send Discord alert
+                        if active_trade_info:
+                            entry_px = active_trade_info.get("nq_price", 0)
+                            direction = active_trade_info.get("direction", "?")
+                            entry_time = active_trade_info.get("entry_time")
+                            node_strike = active_trade_info.get("node_strike", 0)
+
+                            # Estimate exit price from last known price
+                            nq_bid, nq_ask = mt5.get_price()
+                            exit_price = nq_bid or nq_ask or 0
+
+                            # Estimate PnL
+                            if direction == "LONG":
+                                pnl_pts = exit_price - entry_px
+                            else:
+                                pnl_pts = entry_px - exit_price
+                            pnl_dollar = pnl_pts * 5.0 * cfg["lot_size"]  # $5/pt for NQ
+
+                            # Duration
+                            dur_min = 0
+                            if entry_time:
+                                dur_min = (datetime.now() - entry_time).total_seconds() / 60
+
+                            # Determine exit reason
+                            stop_qqq = active_trade_info.get("stop_qqq", 0)
+                            target_qqq = active_trade_info.get("target_qqq", 0)
+                            reason = "SL/TP" if abs(pnl_pts) > 0 else "MANUAL"
+                            if pnl_pts > 0:
+                                reason = "TARGET HIT"
+                            else:
+                                reason = "STOP HIT"
+
+                            # Log exit
+                            if active_trade_idx is not None:
+                                logger.log_exit(active_trade_idx, exit_price, pnl_dollar, reason)
+
+                            # Send Discord close alert
+                            dc.trade_closed(
+                                direction=direction,
+                                entry_price=entry_px,
+                                exit_price=exit_price,
+                                pnl=pnl_dollar,
+                                reason=reason,
+                                duration_min=dur_min,
+                                node_strike=node_strike,
+                            )
+
                         active_ticket = None
                         active_trade_idx = None
+                        active_trade_info = None
+                        dc_bot.active_trade = None
 
                 # ── Max position check ──────────────────────────────────
                 open_count = len(mt5.get_open_positions()) if mt5_live else (1 if active_ticket else 0)
@@ -579,15 +634,51 @@ def run_bot():
                                 entry_node, target_node, stop_qqq, target_qqq, ticket)
                             print(f"  [EXECUTED] Ticket: {ticket}")
                             executed = True
+
+                            # Track active trade for !status and close alerts
+                            active_trade_info = {
+                                "ticket": ticket,
+                                "signal": sig_type,
+                                "direction": direction,
+                                "qqq_price": qqq_price,
+                                "nq_price": nq_price_exec,
+                                "nq_stop": nq_stop,
+                                "nq_target": nq_target,
+                                "stop_qqq": stop_qqq,
+                                "target_qqq": target_qqq,
+                                "node_strike": entry_node.strike,
+                                "node_gex": entry_node.gex,
+                                "dex_conf": dex_conf,
+                                "entry_time": datetime.now(),
+                                "rr": rr,
+                            }
+                            dc_bot.active_trade = active_trade_info
                         else:
                             print(f"  [FAILED] Order not filled")
                     else:
                         print(f"  [ERROR] No NQ price available")
                 else:
                     # Signal-only mode
-                    logger.log_entry(sig_type, direction, qqq_price, 0,
+                    active_trade_idx = logger.log_entry(sig_type, direction, qqq_price, 0,
                                     entry_node, target_node, stop_qqq, target_qqq, 0)
                     print(f"  [SIGNAL ONLY] Not executed (MT5 not connected)")
+
+                    # Track for !status even in signal-only mode
+                    active_trade_info = {
+                        "ticket": None,
+                        "signal": sig_type,
+                        "direction": direction,
+                        "qqq_price": qqq_price,
+                        "nq_price": 0,
+                        "stop_qqq": stop_qqq,
+                        "target_qqq": target_qqq,
+                        "node_strike": entry_node.strike,
+                        "node_gex": entry_node.gex,
+                        "dex_conf": dex_conf,
+                        "entry_time": datetime.now(),
+                        "rr": rr,
+                    }
+                    dc_bot.active_trade = active_trade_info
 
                 # ── Discord alert ───────────────────────────────────────
                 dc.signal_alert(

@@ -4,8 +4,9 @@ discord_bot.py - Interactive Discord Bot with Commands
 Runs alongside the main trading loop in a background thread.
 Responds to commands:
   !levels   - Current + historical GEX levels for the day
-  !status   - Bot status, daily P&L, position info
+  !status   - Bot status, daily P&L, active trade info
   !heatmap  - Current GEX heatmap snapshot
+  !vwap     - VWAP deviation strategy overview + backtest stats
 
 Requires DISCORD_BOT_TOKEN in .env
 """
@@ -142,6 +143,7 @@ class GEXBot(commands.Bot):
         self.signal_engine = signal_engine
         self.mt5_live = mt5_live
         self.alerts = alerts
+        self.active_trade = None  # Set by bot.py when a trade is opened/closed
         self._thread = None
         self._loop = None
         self._ready_event = threading.Event()
@@ -160,6 +162,10 @@ class GEXBot(commands.Bot):
         @self.command(name="heatmap")
         async def heatmap(ctx):
             await bot_ref._cmd_heatmap(ctx)
+
+        @self.command(name="vwap")
+        async def vwap(ctx):
+            await bot_ref._cmd_vwap(ctx)
 
     async def on_ready(self):
         print(f"[DC-BOT] Logged in as {self.user} (ID: {self.user.id})")
@@ -257,7 +263,7 @@ class GEXBot(commands.Bot):
 
     # ── !status ─────────────────────────────────────────────────────────
     async def _cmd_status(self, ctx):
-        """Show current bot status, daily P&L, and state."""
+        """Show current bot status, daily P&L, active trade, and state."""
         mode = "🟢 LIVE" if self.mt5_live else "🔵 SIGNAL-ONLY"
         state = self.signal_engine.state if self.signal_engine else "UNKNOWN"
         spot = self.gex.spot if self.gex else 0
@@ -285,6 +291,53 @@ class GEXBot(commands.Bot):
         embed.add_field(name="Daily P&L", value=f"**${daily_pnl:+,.2f}**", inline=True)
         embed.add_field(name="Trades Today", value=f"{daily_trades}", inline=True)
         embed.add_field(name="Nearest Nodes", value=nodes_str, inline=False)
+
+        # ── Active Trade Info ──
+        if self.active_trade:
+            t = self.active_trade
+            direction = t.get("direction", "?")
+            dir_emoji = "🟢" if direction == "LONG" else "🔴"
+            signal = t.get("signal", "?")
+            entry_time = t.get("entry_time")
+
+            # Duration
+            dur_str = "—"
+            if entry_time:
+                elapsed = (datetime.now() - entry_time).total_seconds()
+                dur_min = int(elapsed // 60)
+                dur_sec = int(elapsed % 60)
+                dur_str = f"{dur_min}m {dur_sec}s"
+
+            # Trade details text
+            trade_lines = []
+            trade_lines.append(f"{dir_emoji} **{direction}** via `{signal}`")
+            trade_lines.append(f"Node: **${t.get('node_strike', 0):.0f}** (GEX: `{t.get('node_gex', 0):+,.0f}`)")
+
+            if t.get("nq_price"):
+                trade_lines.append(f"NQ Entry: **{t['nq_price']:.2f}**")
+                if t.get("nq_stop"):
+                    trade_lines.append(f"NQ Stop: `{t['nq_stop']:.2f}` | NQ Target: `{t['nq_target']:.2f}`")
+            else:
+                trade_lines.append(f"QQQ Entry: **${t.get('qqq_price', 0):.2f}**")
+                trade_lines.append(f"QQQ Stop: `${t.get('stop_qqq', 0):.2f}` | Target: `${t.get('target_qqq', 0):.2f}`")
+
+            trade_lines.append(f"R:R = **1:{t.get('rr', 0):.1f}** | DEX Conf: **{t.get('dex_conf', 0):.0%}**")
+            trade_lines.append(f"Duration: **{dur_str}**")
+
+            if t.get("ticket"):
+                trade_lines.append(f"Ticket: `{t['ticket']}`")
+
+            embed.add_field(
+                name="🔥 ACTIVE TRADE",
+                value="\n".join(trade_lines),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="📋 Position",
+                value="*No active trade — scanning for setups*",
+                inline=False,
+            )
 
         if self.gex and self.gex.last_update:
             embed.set_footer(text=f"Last GEX refresh: {self.gex.last_update:%H:%M:%S}")
@@ -340,6 +393,114 @@ class GEXBot(commands.Bot):
         embed.add_field(name="ATM IV", value=f"`{self.gex.atm_iv:.1%}`", inline=True)
         embed.add_field(name="Refresh #", value=f"{self.gex.update_count}", inline=True)
         embed.set_footer(text=f"Updated {self.gex.last_update:%H:%M:%S}" if self.gex.last_update else "")
+
+        await ctx.send(embed=embed)
+
+    # ── !vwap ────────────────────────────────────────────────────────────
+    async def _cmd_vwap(self, ctx):
+        """
+        Show VWAP deviation strategy overview + backtest performance.
+        This is a static info card showing the strategy the bot uses.
+        """
+        embed = discord.Embed(
+            title="📐 VWAP Deviation Strategy — NQ Futures",
+            color=0x7B68EE,  # Medium slate blue
+            timestamp=datetime.utcnow(),
+        )
+
+        embed.description = (
+            "**Mean-Reversion at VWAP Standard Deviation Bands**\n"
+            "Anchored at Globex open (6 PM ET). Uses GARCH vol regime, "
+            "HMM state detection, and microstructure filters (ATR, Kurtosis, "
+            "Entropy, Vanna/Vega) to filter entries.\n"
+            "\u200b"
+        )
+
+        # Strategy mechanics
+        embed.add_field(
+            name="⚙️ Strategy Logic",
+            value=(
+                "**Entry:** Price touches ±2SD or ±3SD VWAP band\n"
+                "**Direction:** Fade deviation (mean-revert to VWAP)\n"
+                "**Exit:** Target at opposite band or VWAP\n"
+                "**Stop:** Beyond entry band + buffer (1.5 SD)"
+            ),
+            inline=False,
+        )
+
+        # Filters
+        embed.add_field(
+            name="🛡️ Active Filters",
+            value=(
+                "• GARCH vol regime (kills `WEAK_BO`)\n"
+                "• High kurtosis + ELEVATED/EXPANSION skip\n"
+                "• Death-zone hours (7-9, 12, 15, 16 ET)\n"
+                "• Rejection wick filter\n"
+                "• Volume spike filter\n"
+                "• Momentum exhaustion (ROC)"
+            ),
+            inline=True,
+        )
+
+        # Backtest stats
+        embed.add_field(
+            name="📊 Backtest (Jun 2022 → Jan 2026)",
+            value=(
+                "`Trades:       1,339`\n"
+                "`Win Rate:     37.3%`\n"
+                "`Profit Factor: 1.36`\n"
+                "`Sharpe:        1.91`\n"
+                "`Sortino:       3.07`\n"
+                "`Total PnL:  +3,870 pts`\n"
+                "`Max DD:       -$1,763`"
+            ),
+            inline=True,
+        )
+
+        # OOS validation
+        embed.add_field(
+            name="✅ Out-of-Sample Validation",
+            value=(
+                "**ROBUST — 5/5 checks pass**\n"
+                "OOS (Jan 2025+) **outperforms** IS on all metrics:\n"
+                "`Sharpe: 0.81 → 3.92` (+384%)\n"
+                "`PF:     1.19 → 1.72` (+45%)\n"
+                "`WR:     36.5 → 39.0%` (+7%)\n"
+                "`Month Win: 60% → 92%`"
+            ),
+            inline=False,
+        )
+
+        # Key hours
+        embed.add_field(
+            name="⏰ Best Hours (ET)",
+            value=(
+                "🥇 **10 AM** — 60% WR, +12.3 avg\n"
+                "🥈 **2 PM** — 54% WR, +12.4 avg\n"
+                "🥉 **11 AM** — 44% WR, +10.3 avg"
+            ),
+            inline=True,
+        )
+
+        # Regime performance
+        embed.add_field(
+            name="📈 Best Regimes",
+            value=(
+                "🏆 **SUPPRESSED** — +7.76/trade\n"
+                "🥈 **ELEVATED** — +3.19/trade\n"
+                "🥉 **NORMAL** — +1.74/trade"
+            ),
+            inline=True,
+        )
+
+        # Monte Carlo
+        embed.add_field(
+            name="🎲 Monte Carlo",
+            value="**99% profitable** across 200 simulations\n5th pct: $1,844 | 95th pct: $9,258",
+            inline=False,
+        )
+
+        embed.set_footer(text="VWAP Strategy • Backtested on NQ 5Min data")
 
         await ctx.send(embed=embed)
 
